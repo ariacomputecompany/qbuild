@@ -1,0 +1,32 @@
+[package]
+name = "qbuild"
+version = "0.1.0"
+edition = "2024"
+authors = ["Aria Compute Company"]
+description = "Standalone OCI image builder for Quilt-compatible artifacts"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ariacomputecompany/qbuild"
+readme = "README.md"
+
+[dependencies]
+base64 = "0.21"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "5.0"
+flate2 = "1.0"
+glob = "0.3"
+nix = { version = "0.26.4", features = ["mount", "process", "sched", "term"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+shlex = "1.3"
+tar = "0.4"
+thiserror = "1.0"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync"] }
+uuid = { version = "1.10", features = ["v4"] }
+walkdir = "2.5"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.10"
