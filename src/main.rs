@@ -1,11 +1,13 @@
 mod build;
 mod image;
 mod registry;
+mod runtime;
 
 use build::{BuildRequest, BuildService};
 use clap::{Parser, Subcommand};
 use image::{ImageReference, ImageStore, OciManifest};
 use registry::{PullEvent, PullOptions, PushEvent, RegistryClient};
+use runtime::{NamespaceConfig, ResourceLimits, RunRequest, RunService};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -82,6 +84,34 @@ enum Commands {
         password: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Run a locally stored OCI image standalone
+    Run {
+        reference: String,
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        #[arg(long)]
+        workdir: Option<String>,
+        #[arg(long)]
+        memory_mb: Option<u64>,
+        #[arg(long)]
+        cpu_percent: Option<f64>,
+        #[arg(long)]
+        pids_limit: Option<u64>,
+        #[arg(long)]
+        clear_image_env: bool,
+        #[arg(long)]
+        no_mount_namespace: bool,
+        #[arg(long)]
+        uts_namespace: bool,
+        #[arg(long)]
+        ipc_namespace: bool,
+        #[arg(long)]
+        network_namespace: bool,
+        #[arg(last = true)]
+        command: Vec<String>,
     },
     /// Inspect a locally stored OCI image reference
     Inspect {
@@ -281,6 +311,57 @@ async fn run() -> Result<(), AppError> {
                 println!("Manifest: {}", manifest_digest);
             }
         }
+        Commands::Run {
+            reference,
+            store_dir,
+            env,
+            workdir,
+            memory_mb,
+            cpu_percent,
+            pids_limit,
+            clear_image_env,
+            no_mount_namespace,
+            uts_namespace,
+            ipc_namespace,
+            network_namespace,
+            command,
+        } => {
+            let store_dir = store_dir.unwrap_or_else(default_store_dir);
+            let service = RunService::new();
+            let limits = if memory_mb.is_some() || cpu_percent.is_some() || pids_limit.is_some() {
+                Some(ResourceLimits {
+                    memory_limit_bytes: memory_mb.map(|mb| mb * 1024 * 1024),
+                    cpu_quota: cpu_percent.map(|percent| (percent * 1000.0) as i64),
+                    cpu_period: cpu_percent.map(|_| 100000),
+                    pids_limit,
+                })
+            } else {
+                None
+            };
+            let result = service
+                .run(RunRequest {
+                    image_reference: reference,
+                    command,
+                    environment: parse_env_overrides(&env)?,
+                    working_directory: workdir,
+                    store_dir,
+                    namespace_config: NamespaceConfig {
+                        mount: !no_mount_namespace,
+                        uts: uts_namespace,
+                        ipc: ipc_namespace,
+                        network: network_namespace,
+                    },
+                    resource_limits: limits,
+                    clear_image_env,
+                })
+                .await
+                .map_err(AppError::Message)?;
+
+            if !result.exit_status.success() {
+                let code = result.exit_status.code().unwrap_or(1);
+                std::process::exit(code);
+            }
+        }
         Commands::List { store_dir, json } => {
             let store_dir = store_dir.unwrap_or_else(default_store_dir);
             let store = ImageStore::new(&store_dir)?;
@@ -342,6 +423,20 @@ fn parse_build_args(values: &[String]) -> Result<HashMap<String, String>, AppErr
         args.insert(key.to_string(), value.to_string());
     }
     Ok(args)
+}
+
+fn parse_env_overrides(values: &[String]) -> Result<HashMap<String, String>, AppError> {
+    let mut env = HashMap::new();
+    for value in values {
+        let Some((key, value)) = value.split_once('=') else {
+            return Err(AppError::Message(format!(
+                "Invalid env override '{}', expected KEY=VALUE",
+                value
+            )));
+        };
+        env.insert(key.to_string(), value.to_string());
+    }
+    Ok(env)
 }
 
 fn default_data_root() -> PathBuf {

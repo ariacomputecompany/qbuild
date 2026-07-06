@@ -8,6 +8,7 @@
 
 use crate::image::{ImageError, Result};
 use flate2::read::GzDecoder;
+use nix::mount::{umount2, MntFlags};
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -490,6 +491,19 @@ impl LayerManager {
         }
 
         Ok(rootfs)
+    }
+
+    /// Remove a prepared rootfs and overlay state for a container.
+    pub fn cleanup_container_rootfs(&self, container_id: &str) -> Result<()> {
+        let container_dir = self.containers_path.join(container_id);
+        let rootfs = container_dir.join("rootfs");
+        if rootfs.exists() {
+            let _ = umount2(&rootfs, MntFlags::MNT_DETACH);
+        }
+        if container_dir.exists() {
+            std::fs::remove_dir_all(&container_dir)?;
+        }
+        Ok(())
     }
 
     /// Check if overlay filesystem is supported

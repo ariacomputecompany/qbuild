@@ -208,6 +208,11 @@ impl ImageManager {
 
         Ok(rootfs_path)
     }
+
+    /// Remove a prepared container rootfs and any overlay state.
+    pub fn remove_rootfs(&self, container_id: &str) -> Result<()> {
+        self.layers.cleanup_container_rootfs(container_id)
+    }
 }
 
 #[cfg(test)]

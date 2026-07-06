@@ -9,6 +9,7 @@ It does not call the Quilt backend. It builds and pulls images directly into a l
 - Builds OCI images from a local Docker build context
 - Pulls OCI images from standard registries
 - Pushes locally stored OCI images to standard registries
+- Runs locally stored OCI images standalone from the qbuild store
 - Stores blobs, manifests, configs, and reference metadata locally
 - Inspects and lists locally stored image references
 
@@ -60,6 +61,12 @@ Build from a local context:
 qbuild build . --image local.test/my-app:latest
 ```
 
+Run a locally stored image:
+
+```bash
+sudo qbuild run local.test/my-app:latest
+```
+
 Build with explicit paths:
 
 ```bash
@@ -107,6 +114,8 @@ qbuild list
 
 If you want rootless `RUN` support, that should be added here in `qbuild` rather than reimplemented elsewhere.
 
+Standalone container `run` currently also requires root privileges. It uses the same low-level rootfs and namespace model rather than shelling out to Docker or depending on the Quilt backend.
+
 ## Current status
 
 Verified locally:
@@ -117,6 +126,7 @@ Verified locally:
 - end-to-end standalone build of a `FROM scratch` image with `COPY`
 - local inspect of the resulting OCI reference
 - end-to-end local registry loop: build, push, pull, inspect
+- end-to-end standalone build and run of an OCI image from the qbuild store
 
 ## License
 
