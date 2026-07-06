@@ -1,42 +1,44 @@
 # qbuild
 
-`qbuild` is a standalone OCI image builder for Quilt-compatible artifacts.
+`qbuild` builds and runs Quilt images as a standalone OCI container tool.
 
-It does not call the Quilt backend. It builds and pulls images directly into a local OCI content store, using code extracted from Quilt's existing OCI/image/builder stack and then cut free from the sync engine and HTTP API.
+It is bi-directionally compatible with Docker and the broader OCI ecosystem:
+
+- build images locally from Docker build contexts
+- pull standard OCI and Docker images from registries
+- push built images back to standard registries
+- run compatible images locally from the `qbuild` store
+
+That means `qbuild` works for Quilt image workflows and standard Docker-compatible image workflows without requiring a backend service.
 
 ## What it does
 
-- Builds OCI images from a local Docker build context
-- Pulls OCI images from standard registries
-- Pushes locally stored OCI images to standard registries
-- Runs locally stored OCI images standalone from the qbuild store
-- Creates and manages persistent local containers without the Quilt backend
-- Stores blobs, manifests, configs, and reference metadata locally
-- Inspects and lists locally stored image references
+- Builds OCI images from local Docker build contexts
+- Pulls images from standard OCI and Docker registries
+- Pushes images to standard OCI and Docker registries
+- Runs locally stored images
+- Creates and manages persistent local containers
+- Stores image content, metadata, and runtime state locally
+- Inspects and lists local images and containers
 
-## What it does not do
+## What it is not
 
 - It is not a Docker daemon replacement
-- It does not require or use the Quilt backend
+- It is not a hosted build service
+- It does not require a separate backend to build or run images
 
-## Architecture
+## Compatibility
 
-`qbuild` was carved out of `quilt-prod` by copying the existing implementation for:
+`qbuild` is designed around standard OCI image formats and registry workflows.
 
-- `src/build`
-- `src/image`
-- `src/registry`
+In practice that means:
 
-Then replacing backend coupling with a local filesystem-backed contract:
+- standard Docker and OCI base images can be pulled into `qbuild`
+- images built with `qbuild` can be pushed to standard registries
+- Docker-style build contexts and Dockerfiles are supported
+- Quilt image workflows and Docker-compatible image workflows can share the same image distribution model
 
-- no HTTP API
-- no tenant context
-- no SQLite sync engine
-- no server-side operation manager
-
-That keeps the builder lineage direct and gives future work one place to extend rather than splitting the logic into another parallel implementation.
-
-## Local store layout
+## Local data layout
 
 By default `qbuild` stores data under:
 
@@ -46,7 +48,7 @@ By default `qbuild` stores data under:
 ~/.qbuild/containers
 ```
 
-You can override both with `--store-dir` and `--work-dir`.
+You can override paths with flags such as `--store-dir`, `--work-dir`, and `--data-root`.
 
 ## Install
 
@@ -57,19 +59,43 @@ cargo build --release
 
 ## Usage
 
-Build from a local context:
+Build an image from a local context:
 
 ```bash
 qbuild build . --image local.test/my-app:latest
 ```
 
-Run a locally stored image:
+Pull a standard base image:
+
+```bash
+qbuild pull docker.io/library/alpine:3.20
+```
+
+Push a built image to a registry:
+
+```bash
+qbuild push ghcr.io/acme/my-app:dev
+```
+
+Inspect a local image:
+
+```bash
+qbuild inspect local.test/my-app:latest
+```
+
+List local images:
+
+```bash
+qbuild list
+```
+
+Run a local image:
 
 ```bash
 sudo qbuild run local.test/my-app:latest
 ```
 
-Create, start, inspect, and stop a persistent local container:
+Create and manage a persistent local container:
 
 ```bash
 CID=$(qbuild create local.test/my-app:latest)
@@ -90,59 +116,25 @@ qbuild build ./app \
   --work-dir /tmp/qbuild-work
 ```
 
-Pull a base image into the local store:
-
-```bash
-qbuild pull docker.io/library/alpine:3.20
-```
-
-Push a locally built image to a registry:
-
-```bash
-qbuild push ghcr.io/acme/my-app:dev
-```
-
-Inspect a locally stored reference:
-
-```bash
-qbuild inspect docker.io/library/alpine:3.20
-```
-
-List local references:
-
-```bash
-qbuild list
-```
-
 ## Privilege model
 
-`COPY`/`ADD`-only builds can run unprivileged.
+`COPY` and `ADD` only builds can run unprivileged.
 
-`RUN` steps use the same chroot-and-mount execution model as Quilt's current builder. In practice that means:
+Builds that execute `RUN` steps currently rely on low-level Linux container primitives. `qbuild` performs a preflight check and fails fast when the current environment cannot support that execution model.
 
-- `/proc` mount setup may require elevated privileges
-- device node setup for `/dev/null`, `/dev/zero`, and related paths may require elevated privileges
+Local image `run`, and persistent container `start` and `stop`, currently require root privileges in the current runtime model.
 
-`qbuild` now performs an explicit preflight for Dockerfiles that contain `RUN` and fails fast if the current worker cannot satisfy that execution model.
-
-If you want rootless `RUN` support, that should be added here in `qbuild` rather than reimplemented elsewhere.
-
-Standalone container `run` currently also requires root privileges. It uses the same low-level rootfs and namespace model rather than shelling out to Docker or depending on the Quilt backend.
-
-Persistent container `start` and `stop` use the same standalone runtime model and also currently require root privileges.
-
-## Current status
+## Verification
 
 Verified locally:
 
 - `cargo check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
-- end-to-end standalone build of a `FROM scratch` image with `COPY`
-- local inspect of the resulting OCI reference
-- end-to-end local registry loop: build, push, pull, inspect
-- end-to-end standalone build and run of an OCI image from the qbuild store
-- end-to-end persistent container lifecycle: create, start, ps, logs, stop, rm
+- end-to-end image build
+- end-to-end registry push and pull
+- end-to-end local image run
+- end-to-end persistent container lifecycle
 
 ## License
 
