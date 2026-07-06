@@ -1,11 +1,14 @@
 mod build;
+mod containers;
 mod image;
 mod registry;
 mod runtime;
 
 use build::{BuildRequest, BuildService};
 use clap::{Parser, Subcommand};
+use containers::{ContainerStore, CreateContainerRequest};
 use image::{ImageReference, ImageStore, OciManifest};
+use nix::sys::signal::Signal;
 use registry::{PullEvent, PullOptions, PushEvent, RegistryClient};
 use runtime::{NamespaceConfig, ResourceLimits, RunRequest, RunService};
 use serde::Serialize;
@@ -113,6 +116,81 @@ enum Commands {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Create a persistent local container definition
+    Create {
+        reference: String,
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        #[arg(long)]
+        workdir: Option<String>,
+        #[arg(long)]
+        memory_mb: Option<u64>,
+        #[arg(long)]
+        cpu_percent: Option<f64>,
+        #[arg(long)]
+        pids_limit: Option<u64>,
+        #[arg(long)]
+        clear_image_env: bool,
+        #[arg(long)]
+        no_mount_namespace: bool,
+        #[arg(long)]
+        uts_namespace: bool,
+        #[arg(long)]
+        ipc_namespace: bool,
+        #[arg(long)]
+        network_namespace: bool,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Start a persistent local container
+    Start {
+        id: String,
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+    },
+    /// Stop a running local container
+    Stop {
+        id: String,
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+        #[arg(long, default_value = "term")]
+        signal: String,
+    },
+    /// Remove a stopped local container
+    Rm {
+        id: String,
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+    },
+    /// List local containers
+    Ps {
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print container logs
+    Logs {
+        id: String,
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(long)]
+        stderr: bool,
+    },
     /// Inspect a locally stored OCI image reference
     Inspect {
         reference: String,
@@ -127,6 +205,15 @@ enum Commands {
         store_dir: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+    },
+    #[command(hide = true)]
+    __InternalExec {
+        #[arg(long)]
+        data_root: PathBuf,
+        #[arg(long)]
+        store_dir: PathBuf,
+        #[arg(long)]
+        container_id: String,
     },
 }
 
@@ -328,16 +415,7 @@ async fn run() -> Result<(), AppError> {
         } => {
             let store_dir = store_dir.unwrap_or_else(default_store_dir);
             let service = RunService::new();
-            let limits = if memory_mb.is_some() || cpu_percent.is_some() || pids_limit.is_some() {
-                Some(ResourceLimits {
-                    memory_limit_bytes: memory_mb.map(|mb| mb * 1024 * 1024),
-                    cpu_quota: cpu_percent.map(|percent| (percent * 1000.0) as i64),
-                    cpu_period: cpu_percent.map(|_| 100000),
-                    pids_limit,
-                })
-            } else {
-                None
-            };
+            let limits = build_limits(memory_mb, cpu_percent, pids_limit);
             let result = service
                 .run(RunRequest {
                     image_reference: reference,
@@ -353,6 +431,9 @@ async fn run() -> Result<(), AppError> {
                     },
                     resource_limits: limits,
                     clear_image_env,
+                    container_id: None,
+                    status_file: None,
+                    started_at: None,
                 })
                 .await
                 .map_err(AppError::Message)?;
@@ -361,6 +442,112 @@ async fn run() -> Result<(), AppError> {
                 let code = result.exit_status.code().unwrap_or(1);
                 std::process::exit(code);
             }
+        }
+        Commands::Create {
+            reference,
+            store_dir,
+            data_root,
+            env,
+            workdir,
+            memory_mb,
+            cpu_percent,
+            pids_limit,
+            clear_image_env,
+            no_mount_namespace,
+            uts_namespace,
+            ipc_namespace,
+            network_namespace,
+            command,
+        } => {
+            let store_dir = store_dir.unwrap_or_else(default_store_dir);
+            let data_root = data_root.unwrap_or_else(default_data_root);
+            let store = ContainerStore::new(&data_root, &store_dir).map_err(AppError::Message)?;
+            let record = store
+                .create(CreateContainerRequest {
+                    image_reference: reference,
+                    command,
+                    environment: parse_env_overrides(&env)?,
+                    working_directory: workdir,
+                    namespace_config: NamespaceConfig {
+                        mount: !no_mount_namespace,
+                        uts: uts_namespace,
+                        ipc: ipc_namespace,
+                        network: network_namespace,
+                    },
+                    resource_limits: build_limits(memory_mb, cpu_percent, pids_limit),
+                    clear_image_env,
+                })
+                .map_err(AppError::Message)?;
+            println!("{}", record.id);
+        }
+        Commands::Start {
+            id,
+            store_dir,
+            data_root,
+        } => {
+            let store_dir = store_dir.unwrap_or_else(default_store_dir);
+            let data_root = data_root.unwrap_or_else(default_data_root);
+            let store = ContainerStore::new(&data_root, &store_dir).map_err(AppError::Message)?;
+            let record = store.start(&id).map_err(AppError::Message)?;
+            println!("{} {}", record.id, record.pid.unwrap_or_default());
+        }
+        Commands::Stop {
+            id,
+            store_dir,
+            data_root,
+            signal,
+        } => {
+            let store_dir = store_dir.unwrap_or_else(default_store_dir);
+            let data_root = data_root.unwrap_or_else(default_data_root);
+            let store = ContainerStore::new(&data_root, &store_dir).map_err(AppError::Message)?;
+            let record = store
+                .stop(&id, parse_signal(&signal)?)
+                .map_err(AppError::Message)?;
+            println!("{}", record.id);
+        }
+        Commands::Rm {
+            id,
+            store_dir,
+            data_root,
+        } => {
+            let store_dir = store_dir.unwrap_or_else(default_store_dir);
+            let data_root = data_root.unwrap_or_else(default_data_root);
+            let store = ContainerStore::new(&data_root, &store_dir).map_err(AppError::Message)?;
+            store.remove(&id).map_err(AppError::Message)?;
+        }
+        Commands::Ps {
+            store_dir,
+            data_root,
+            json,
+        } => {
+            let store_dir = store_dir.unwrap_or_else(default_store_dir);
+            let data_root = data_root.unwrap_or_else(default_data_root);
+            let store = ContainerStore::new(&data_root, &store_dir).map_err(AppError::Message)?;
+            let containers = store.list().map_err(AppError::Message)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&containers)?);
+            } else {
+                for container in containers {
+                    println!(
+                        "{}\t{}\t{:?}\t{}",
+                        container.id,
+                        container.image_reference,
+                        container.state,
+                        container.pid.map(|pid| pid.to_string()).unwrap_or_default()
+                    );
+                }
+            }
+        }
+        Commands::Logs {
+            id,
+            data_root,
+            store_dir,
+            stderr,
+        } => {
+            let store_dir = store_dir.unwrap_or_else(default_store_dir);
+            let data_root = data_root.unwrap_or_else(default_data_root);
+            let store = ContainerStore::new(&data_root, &store_dir).map_err(AppError::Message)?;
+            print!("{}", store.logs(&id, stderr).map_err(AppError::Message)?);
         }
         Commands::List { store_dir, json } => {
             let store_dir = store_dir.unwrap_or_else(default_store_dir);
@@ -374,6 +561,20 @@ async fn run() -> Result<(), AppError> {
                 for (reference, digest) in refs {
                     println!("{}\t{}", reference, digest);
                 }
+            }
+        }
+        Commands::__InternalExec {
+            data_root,
+            store_dir,
+            container_id,
+        } => {
+            let store = ContainerStore::new(&data_root, &store_dir).map_err(AppError::Message)?;
+            let result = store
+                .run_managed(&container_id)
+                .await
+                .map_err(AppError::Message)?;
+            if !result.exit_status.success() {
+                std::process::exit(result.exit_status.code().unwrap_or(1));
             }
         }
     }
@@ -451,6 +652,35 @@ fn default_store_dir() -> PathBuf {
 
 fn default_work_dir() -> PathBuf {
     default_data_root().join("builds")
+}
+
+fn build_limits(
+    memory_mb: Option<u64>,
+    cpu_percent: Option<f64>,
+    pids_limit: Option<u64>,
+) -> Option<ResourceLimits> {
+    if memory_mb.is_some() || cpu_percent.is_some() || pids_limit.is_some() {
+        Some(ResourceLimits {
+            memory_limit_bytes: memory_mb.map(|mb| mb * 1024 * 1024),
+            cpu_quota: cpu_percent.map(|percent| (percent * 1000.0) as i64),
+            cpu_period: cpu_percent.map(|_| 100000),
+            pids_limit,
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_signal(value: &str) -> Result<Signal, AppError> {
+    match value.to_ascii_lowercase().as_str() {
+        "term" | "sigterm" => Ok(Signal::SIGTERM),
+        "kill" | "sigkill" => Ok(Signal::SIGKILL),
+        "int" | "sigint" => Ok(Signal::SIGINT),
+        other => Err(AppError::Message(format!(
+            "Unsupported signal '{}', expected term|kill|int",
+            other
+        ))),
+    }
 }
 
 fn print_pull_event(event: PullEvent) {

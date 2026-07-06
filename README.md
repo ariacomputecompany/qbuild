@@ -10,6 +10,7 @@ It does not call the Quilt backend. It builds and pulls images directly into a l
 - Pulls OCI images from standard registries
 - Pushes locally stored OCI images to standard registries
 - Runs locally stored OCI images standalone from the qbuild store
+- Creates and manages persistent local containers without the Quilt backend
 - Stores blobs, manifests, configs, and reference metadata locally
 - Inspects and lists locally stored image references
 
@@ -42,6 +43,7 @@ By default `qbuild` stores data under:
 ```text
 ~/.qbuild/images
 ~/.qbuild/builds
+~/.qbuild/containers
 ```
 
 You can override both with `--store-dir` and `--work-dir`.
@@ -65,6 +67,17 @@ Run a locally stored image:
 
 ```bash
 sudo qbuild run local.test/my-app:latest
+```
+
+Create, start, inspect, and stop a persistent local container:
+
+```bash
+CID=$(qbuild create local.test/my-app:latest)
+sudo qbuild start "$CID"
+qbuild ps
+qbuild logs "$CID"
+sudo qbuild stop "$CID"
+qbuild rm "$CID"
 ```
 
 Build with explicit paths:
@@ -116,6 +129,8 @@ If you want rootless `RUN` support, that should be added here in `qbuild` rather
 
 Standalone container `run` currently also requires root privileges. It uses the same low-level rootfs and namespace model rather than shelling out to Docker or depending on the Quilt backend.
 
+Persistent container `start` and `stop` use the same standalone runtime model and also currently require root privileges.
+
 ## Current status
 
 Verified locally:
@@ -127,6 +142,7 @@ Verified locally:
 - local inspect of the resulting OCI reference
 - end-to-end local registry loop: build, push, pull, inspect
 - end-to-end standalone build and run of an OCI image from the qbuild store
+- end-to-end persistent container lifecycle: create, start, ps, logs, stop, rm
 
 ## License
 

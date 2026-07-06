@@ -1,13 +1,14 @@
 use crate::image::{ImageManager, ImageReference, OciImage};
 use nix::mount::{mount, MsFlags};
 use nix::sched::CloneFlags;
-use nix::unistd::{chdir, chroot, Gid, Uid};
+use nix::unistd::{chdir, chroot, setpgid, Gid, Pid, Uid};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NamespaceConfig {
     pub mount: bool,
     pub uts: bool,
@@ -26,7 +27,7 @@ impl Default for NamespaceConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ResourceLimits {
     pub memory_limit_bytes: Option<u64>,
     pub cpu_quota: Option<i64>,
@@ -34,7 +35,7 @@ pub struct ResourceLimits {
     pub pids_limit: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunRequest {
     pub image_reference: String,
     pub command: Vec<String>,
@@ -44,6 +45,9 @@ pub struct RunRequest {
     pub namespace_config: NamespaceConfig,
     pub resource_limits: Option<ResourceLimits>,
     pub clear_image_env: bool,
+    pub container_id: Option<String>,
+    pub status_file: Option<PathBuf>,
+    pub started_at: Option<i64>,
 }
 
 pub struct RunResult {
@@ -80,7 +84,10 @@ impl RunService {
             .await
             .map_err(|e| format!("Failed to load image '{}': {}", request.image_reference, e))?;
 
-        let container_id = format!("run-{}", uuid::Uuid::new_v4());
+        let container_id = request
+            .container_id
+            .clone()
+            .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
         let rootfs = image_manager
             .prepare_rootfs(&image, &container_id)
             .await
@@ -145,6 +152,9 @@ impl RunService {
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
 
+                setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+
                 prepare_runtime_rootfs(&rootfs).map_err(std::io::Error::other)?;
                 chroot(&rootfs).map_err(|e| std::io::Error::other(e.to_string()))?;
                 chdir("/").map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -177,6 +187,10 @@ impl RunService {
             manager.add_process(child.id() as i32)?;
         }
 
+        if let Some(status_file) = &request.status_file {
+            write_runtime_status(status_file, child.id(), request.started_at)?;
+        }
+
         let status = child
             .wait()
             .map_err(|e| format!("Failed to wait for container process: {}", e))?;
@@ -184,6 +198,36 @@ impl RunService {
             exit_status: status,
         })
     }
+}
+
+#[derive(Serialize)]
+struct RuntimeStatus<'a> {
+    id: &'a str,
+    state: &'a str,
+    pid: u32,
+    exit_code: Option<i32>,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+fn write_runtime_status(path: &Path, pid: u32, started_at: Option<i64>) -> Result<(), String> {
+    let id = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("Invalid runtime status path '{}'", path.display()))?;
+    let payload = RuntimeStatus {
+        id,
+        state: "running",
+        pid,
+        exit_code: None,
+        started_at,
+        finished_at: None,
+    };
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|e| format!("Failed to encode runtime status '{}': {}", path.display(), e))?;
+    std::fs::write(path, bytes)
+        .map_err(|e| format!("Failed to write runtime status '{}': {}", path.display(), e))
 }
 
 fn ensure_runtime_prerequisites() -> Result<(), String> {
