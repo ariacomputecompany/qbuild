@@ -131,14 +131,15 @@ impl ContentStore {
         let exists = path.exists();
 
         // Update cache if exists
-        if exists && self.get_blob(digest).is_ok() {
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                let mut cache = self.cache.write().map_err(|e| {
-                    ImageError::StoreError(format!("Failed to acquire write lock: {}", e))
-                })?;
-                cache.insert(digest.to_string(), metadata.len());
-                return Ok(true);
-            }
+        if exists
+            && self.get_blob(digest).is_ok()
+            && let Ok(metadata) = std::fs::metadata(&path)
+        {
+            let mut cache = self.cache.write().map_err(|e| {
+                ImageError::StoreError(format!("Failed to acquire write lock: {}", e))
+            })?;
+            cache.insert(digest.to_string(), metadata.len());
+            return Ok(true);
         }
 
         Ok(false)
@@ -322,10 +323,17 @@ impl ImageStore {
             }
 
             let registry = &components[0];
-            let tag = components.last().cloned().unwrap_or_default().replace('_', ":");
+            let tag = components
+                .last()
+                .cloned()
+                .unwrap_or_default()
+                .replace('_', ":");
             let repository = components[1..components.len() - 1].join("/");
             let manifest_digest = std::fs::read_to_string(path)?.trim().to_string();
-            refs.push((format!("{}/{}:{}", registry, repository, tag), manifest_digest));
+            refs.push((
+                format!("{}/{}:{}", registry, repository, tag),
+                manifest_digest,
+            ));
         }
 
         refs.sort();

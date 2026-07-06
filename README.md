@@ -8,6 +8,7 @@ It does not call the Quilt backend. It builds and pulls images directly into a l
 
 - Builds OCI images from a local Docker build context
 - Pulls OCI images from standard registries
+- Pushes locally stored OCI images to standard registries
 - Stores blobs, manifests, configs, and reference metadata locally
 - Inspects and lists locally stored image references
 
@@ -15,7 +16,6 @@ It does not call the Quilt backend. It builds and pulls images directly into a l
 
 - It is not a Docker daemon replacement
 - It does not require or use the Quilt backend
-- It does not currently push images to remote registries
 
 ## Architecture
 
@@ -76,6 +76,12 @@ Pull a base image into the local store:
 qbuild pull docker.io/library/alpine:3.20
 ```
 
+Push a locally built image to a registry:
+
+```bash
+qbuild push ghcr.io/acme/my-app:dev
+```
+
 Inspect a locally stored reference:
 
 ```bash
@@ -97,6 +103,8 @@ qbuild list
 - `/proc` mount setup may require elevated privileges
 - device node setup for `/dev/null`, `/dev/zero`, and related paths may require elevated privileges
 
+`qbuild` now performs an explicit preflight for Dockerfiles that contain `RUN` and fails fast if the current worker cannot satisfy that execution model.
+
 If you want rootless `RUN` support, that should be added here in `qbuild` rather than reimplemented elsewhere.
 
 ## Current status
@@ -104,9 +112,11 @@ If you want rootless `RUN` support, that should be added here in `qbuild` rather
 Verified locally:
 
 - `cargo check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
 - end-to-end standalone build of a `FROM scratch` image with `COPY`
 - local inspect of the resulting OCI reference
+- end-to-end local registry loop: build, push, pull, inspect
 
 ## License
 

@@ -61,10 +61,10 @@ impl LayerManager {
             let cache = self.cache.read().map_err(|e| {
                 ImageError::LayerExtractionError(format!("Failed to acquire read lock: {}", e))
             })?;
-            if let Some(info) = cache.get(digest) {
-                if self.layer_is_ready(&info.path) {
-                    return Ok(info.path.clone());
-                }
+            if let Some(info) = cache.get(digest)
+                && self.layer_is_ready(&info.path)
+            {
+                return Ok(info.path.clone());
             }
         }
 
@@ -789,9 +789,11 @@ mod tests {
             paths
         });
 
-        assert!(paths
-            .iter()
-            .all(|path| path == &paths[0] && path.join(".quilt-layer-ready").exists()));
+        assert!(
+            paths
+                .iter()
+                .all(|path| path == &paths[0] && path.join(".quilt-layer-ready").exists())
+        );
         assert_eq!(
             std::fs::read(paths[0].join("usr/share/zoneinfo/right/America/Barbados")).unwrap(),
             b"ok"

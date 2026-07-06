@@ -5,7 +5,7 @@ mod registry;
 use build::{BuildRequest, BuildService};
 use clap::{Parser, Subcommand};
 use image::{ImageReference, ImageStore, OciManifest};
-use registry::{PullEvent, PullOptions, RegistryClient};
+use registry::{PullEvent, PullOptions, PushEvent, RegistryClient};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,11 @@ enum AppError {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "qbuild", version, about = "Standalone OCI image builder for Quilt-compatible artifacts")]
+#[command(
+    name = "qbuild",
+    version,
+    about = "Standalone OCI image builder for Quilt-compatible artifacts"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -64,6 +68,18 @@ enum Commands {
         password: Option<String>,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Push a locally stored OCI image reference to a registry
+    Push {
+        reference: String,
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -220,6 +236,51 @@ async fn run() -> Result<(), AppError> {
                 println!("Size: {} bytes", output.size_bytes);
             }
         }
+        Commands::Push {
+            reference,
+            store_dir,
+            username,
+            password,
+            json,
+        } => {
+            let store_dir = store_dir.unwrap_or_else(default_store_dir);
+            let store = ImageStore::new(&store_dir)?;
+            let reference = ImageReference::parse(&reference)
+                .map_err(|e| AppError::Message(format!("Invalid reference: {}", e)))?;
+            let manifest_digest = store.resolve_image_ref(&reference)?.ok_or_else(|| {
+                AppError::Message(format!("Reference '{}' not found locally", reference))
+            })?;
+            let client = RegistryClient::new()?;
+            let progress: registry::PushProgress = Box::new(print_push_event);
+            match (username.as_deref(), password.as_deref()) {
+                (Some(username), Some(password)) => {
+                    client.set_registry_credentials(&reference.registry, username, password)?;
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(AppError::Message(
+                        "Both --username and --password are required together".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+            client
+                .push(&reference, &store, &manifest_digest, Some(&progress))
+                .await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "reference": reference.to_string(),
+                        "manifest_digest": manifest_digest,
+                        "registry": reference.registry,
+                        "repository": reference.repository,
+                    }))?
+                );
+            } else {
+                println!("Pushed {}", reference);
+                println!("Manifest: {}", manifest_digest);
+            }
+        }
         Commands::List { store_dir, json } => {
             let store_dir = store_dir.unwrap_or_else(default_store_dir);
             let store = ImageStore::new(&store_dir)?;
@@ -323,5 +384,22 @@ fn print_pull_event(event: PullEvent) {
             eprintln!("complete {} ({} bytes)", digest, size)
         }
         PullEvent::Error { message } => eprintln!("pull error: {}", message),
+    }
+}
+
+fn print_push_event(event: PushEvent) {
+    match event {
+        PushEvent::Started { reference } => eprintln!("pushing {}", reference),
+        PushEvent::UploadingBlob { digest, size } => {
+            eprintln!("uploading {} ({} bytes)", digest, size)
+        }
+        PushEvent::BlobMounted { digest } => eprintln!("blob already present {}", digest),
+        PushEvent::BlobUploaded { digest, size } => {
+            eprintln!("uploaded {} ({} bytes)", digest, size)
+        }
+        PushEvent::ManifestUploaded { digest } => eprintln!("uploaded manifest {}", digest),
+        PushEvent::Complete { reference, digest } => {
+            eprintln!("push complete {} ({})", reference, digest)
+        }
     }
 }

@@ -3,10 +3,10 @@ use crate::image::{
     OciImageConfig, OciManifest, RootFs,
 };
 use crate::registry::{PullOptions, RegistryClient};
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use glob::glob;
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
@@ -38,6 +38,14 @@ pub struct BuildResult {
 pub struct BuildService {
     image_store_path: PathBuf,
     build_work_path: PathBuf,
+}
+
+struct BuildExecutionContext<'a> {
+    stages: &'a [StageSpec],
+    prior_outputs: &'a [StageOutput],
+    request: &'a BuildRequest,
+    context_root: &'a Path,
+    work_root: &'a Path,
 }
 
 impl BuildService {
@@ -75,6 +83,7 @@ impl BuildService {
             )
         })?;
         let instructions = parse_dockerfile(&dockerfile_text)?;
+        verify_build_execution_requirements(&instructions)?;
         let stages = group_stages(&instructions)?;
         let target_stage_index = resolve_target_stage_index(&stages, req.target_stage.as_deref())?;
 
@@ -85,17 +94,14 @@ impl BuildService {
 
         let mut stage_outputs = Vec::with_capacity(stages.len());
         for (idx, stage) in stages.iter().enumerate() {
-            let output = self
-                .build_stage(
-                    idx,
-                    stage,
-                    &stages,
-                    &stage_outputs,
-                    &req,
-                    &req.context_dir,
-                    &work_root,
-                )
-                .await?;
+            let context = BuildExecutionContext {
+                stages: &stages,
+                prior_outputs: &stage_outputs,
+                request: &req,
+                context_root: &req.context_dir,
+                work_root: &work_root,
+            };
+            let output = self.build_stage(idx, stage, &context).await?;
             stage_outputs.push(output);
             if idx == target_stage_index {
                 break;
@@ -149,13 +155,9 @@ impl BuildService {
         &self,
         idx: usize,
         stage: &StageSpec,
-        all_stages: &[StageSpec],
-        prior_outputs: &[StageOutput],
-        req: &BuildRequest,
-        context_root: &Path,
-        work_root: &Path,
+        context: &BuildExecutionContext<'_>,
     ) -> Result<StageOutput, String> {
-        let stage_root = work_root.join(format!("stage-{}", idx));
+        let stage_root = context.work_root.join(format!("stage-{}", idx));
         std::fs::create_dir_all(&stage_root)
             .map_err(|e| format!("Failed to create stage workspace: {}", e))?;
         let rootfs = stage_root.join("rootfs");
@@ -196,7 +198,7 @@ impl BuildService {
         }
 
         let mut env_map = env_vec_to_map(config.env.clone().unwrap_or_default());
-        let mut build_args = collect_stage_build_args(all_stages, req, idx);
+        let mut build_args = collect_stage_build_args(context.stages, context.request, idx);
         let mut current_shell = config
             .shell
             .clone()
@@ -209,11 +211,11 @@ impl BuildService {
         for instruction in &stage.instructions {
             match instruction {
                 Instruction::Arg { name, default } => {
-                    if !build_args.contains_key(name) {
-                        if let Some(default) = default.clone() {
-                            build_args
-                                .insert(name.clone(), interpolate(&default, &env_map, &build_args));
-                        }
+                    if !build_args.contains_key(name)
+                        && let Some(default) = default.clone()
+                    {
+                        build_args
+                            .insert(name.clone(), interpolate(&default, &env_map, &build_args));
                     }
                     history.push(history_entry("ARG", &format!("ARG {}", name), true));
                 }
@@ -263,9 +265,9 @@ impl BuildService {
                     let before = snapshot_rootfs(&rootfs, &stage_root, "before-copy")?;
                     perform_copy(
                         copy,
-                        context_root,
+                        context.context_root,
                         &rootfs,
-                        prior_outputs,
+                        context.prior_outputs,
                         &current_workdir,
                         &env_map,
                         &build_args,
@@ -280,7 +282,7 @@ impl BuildService {
                     let before = snapshot_rootfs(&rootfs, &stage_root, "before-add")?;
                     perform_add(
                         copy,
-                        context_root,
+                        context.context_root,
                         &rootfs,
                         &current_workdir,
                         &env_map,
@@ -365,7 +367,10 @@ impl BuildService {
             .into_iter()
             .filter(|layer| !layer.descriptor.digest.is_empty())
             .collect::<Vec<_>>();
-        let total_size = layers.iter().map(|layer| layer.descriptor.size).sum::<u64>();
+        let total_size = layers
+            .iter()
+            .map(|layer| layer.descriptor.size)
+            .sum::<u64>();
         let manifest = OciManifest {
             schema_version: 2,
             media_type: Some(MediaType::OciManifest.to_string()),
@@ -376,7 +381,10 @@ impl BuildService {
                 urls: None,
                 annotations: None,
             },
-            layers: layers.iter().map(|layer| layer.descriptor.clone()).collect(),
+            layers: layers
+                .iter()
+                .map(|layer| layer.descriptor.clone())
+                .collect(),
             annotations: None,
         };
 
@@ -570,12 +578,67 @@ fn parse_dockerfile(input: &str) -> Result<Vec<Instruction>, String> {
                 return Err(format!(
                     "Unsupported Dockerfile instruction '{}'",
                     unsupported
-                ))
+                ));
             }
         };
         instructions.push(instruction);
     }
     Ok(instructions)
+}
+
+fn verify_build_execution_requirements(instructions: &[Instruction]) -> Result<(), String> {
+    let requires_run = instructions
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::Run { .. }));
+    if !requires_run {
+        return Ok(());
+    }
+
+    if !nix::unistd::Uid::effective().is_root() {
+        return Err(
+            "Dockerfiles with RUN require elevated privileges in qbuild's current execution model. Re-run as root or use a privileged build worker.".to_string(),
+        );
+    }
+
+    let probe_root =
+        std::env::temp_dir().join(format!("qbuild-run-probe-{}", uuid::Uuid::new_v4()));
+    let proc_path = probe_root.join("proc");
+    let dev_path = probe_root.join("dev");
+    std::fs::create_dir_all(&proc_path)
+        .and_then(|_| std::fs::create_dir_all(&dev_path))
+        .map_err(|e| format!("Failed to initialize RUN privilege probe: {}", e))?;
+
+    let mount_result = mount(
+        Some("proc"),
+        &proc_path,
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    );
+    let mount_err = mount_result.err();
+    if mount_err.is_none() {
+        let _ = umount2(&proc_path, MntFlags::MNT_DETACH);
+    }
+
+    let null_probe = dev_path.join("null");
+    let mknod_result = ensure_device_node_from_host(&null_probe, Path::new("/dev/null"));
+
+    let _ = std::fs::remove_dir_all(&probe_root);
+
+    if let Some(err) = mount_err {
+        return Err(format!(
+            "Dockerfiles with RUN require proc-mount capability in qbuild's current execution model: {}",
+            err
+        ));
+    }
+    if let Err(err) = mknod_result {
+        return Err(format!(
+            "Dockerfiles with RUN require device-node creation capability in qbuild's current execution model: {}",
+            err
+        ));
+    }
+
+    Ok(())
 }
 
 fn group_stages(instructions: &[Instruction]) -> Result<Vec<StageSpec>, String> {
@@ -657,7 +720,10 @@ fn parse_env_instruction(rest: &str) -> Result<Instruction, String> {
     if tokens.len() < 2 {
         return Err("ENV requires at least a key and value".to_string());
     }
-    Ok(Instruction::Env(vec![(tokens[0].clone(), tokens[1..].join(" "))]))
+    Ok(Instruction::Env(vec![(
+        tokens[0].clone(),
+        tokens[1..].join(" "),
+    )]))
 }
 
 fn parse_copy_instruction(rest: &str) -> Result<CopyInstruction, String> {
@@ -785,8 +851,7 @@ fn execute_run(
     unsafe {
         cmd.pre_exec(move || {
             std::env::set_current_dir(&host_workdir)?;
-            nix::unistd::chroot(&rootfs)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            nix::unistd::chroot(&rootfs).map_err(|e| std::io::Error::other(e.to_string()))?;
             nix::unistd::chdir("/").map_err(|e| std::io::Error::other(e.to_string()))?;
             if let Some((uid, gid)) = uid_gid {
                 nix::unistd::setgid(nix::unistd::Gid::from_raw(gid))
@@ -831,7 +896,11 @@ fn perform_copy(
         let stage = prior_outputs
             .iter()
             .find(|stage| stage.name.as_deref() == Some(from))
-            .or_else(|| from.parse::<usize>().ok().and_then(|idx| prior_outputs.get(idx)))
+            .or_else(|| {
+                from.parse::<usize>()
+                    .ok()
+                    .and_then(|idx| prior_outputs.get(idx))
+            })
             .ok_or_else(|| {
                 format!(
                     "COPY --from='{}' references an unknown completed stage",
@@ -898,7 +967,11 @@ fn perform_add(
     Ok(())
 }
 
-fn resolve_copy_matches(base: &Path, source: &str, stage_root: bool) -> Result<Vec<PathBuf>, String> {
+fn resolve_copy_matches(
+    base: &Path,
+    source: &str,
+    stage_root: bool,
+) -> Result<Vec<PathBuf>, String> {
     let relative = normalize_relative_path(source)
         .ok_or_else(|| format!("Source path '{}' escapes the build context", source))?;
     let pattern = base.join(&relative).to_string_lossy().to_string();
@@ -1008,7 +1081,10 @@ fn compute_diff_entries(before: &Path, after: &Path) -> Result<DiffEntries, Stri
             changed.push(path.clone());
         }
     }
-    let mut removed = before_paths.difference(&after_paths).cloned().collect::<Vec<_>>();
+    let mut removed = before_paths
+        .difference(&after_paths)
+        .cloned()
+        .collect::<Vec<_>>();
     removed.sort();
     changed.sort();
     Ok(DiffEntries {
@@ -1047,35 +1123,36 @@ fn index_tree(root: &Path) -> Result<BTreeMap<PathBuf, FsEntryMeta>, String> {
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|e| format!("Failed to read metadata for '{}': {}", path.display(), e))?;
         let file_type = metadata.file_type();
-        let meta = if file_type.is_dir() {
-            FsEntryMeta {
-                kind: "dir".to_string(),
-                mode: metadata.permissions().mode(),
-                size: 0,
-                digest: None,
-                symlink_target: None,
-            }
-        } else if file_type.is_symlink() {
-            FsEntryMeta {
-                kind: "symlink".to_string(),
-                mode: metadata.permissions().mode(),
-                size: 0,
-                digest: None,
-                symlink_target: Some(std::fs::read_link(path).map_err(|e| {
-                    format!("Failed to read symlink '{}': {}", path.display(), e)
-                })?),
-            }
-        } else if file_type.is_file() {
-            FsEntryMeta {
-                kind: "file".to_string(),
-                mode: metadata.permissions().mode(),
-                size: metadata.len(),
-                digest: Some(hash_file(path)?),
-                symlink_target: None,
-            }
-        } else {
-            continue;
-        };
+        let meta =
+            if file_type.is_dir() {
+                FsEntryMeta {
+                    kind: "dir".to_string(),
+                    mode: metadata.permissions().mode(),
+                    size: 0,
+                    digest: None,
+                    symlink_target: None,
+                }
+            } else if file_type.is_symlink() {
+                FsEntryMeta {
+                    kind: "symlink".to_string(),
+                    mode: metadata.permissions().mode(),
+                    size: 0,
+                    digest: None,
+                    symlink_target: Some(std::fs::read_link(path).map_err(|e| {
+                        format!("Failed to read symlink '{}': {}", path.display(), e)
+                    })?),
+                }
+            } else if file_type.is_file() {
+                FsEntryMeta {
+                    kind: "file".to_string(),
+                    mode: metadata.permissions().mode(),
+                    size: metadata.len(),
+                    digest: Some(hash_file(path)?),
+                    symlink_target: None,
+                }
+            } else {
+                continue;
+            };
         index.insert(relative, meta);
     }
     Ok(index)
@@ -1532,7 +1609,10 @@ fn prepare_build_rootfs(rootfs: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to create build rootfs /proc: {}", e))?;
 
     for name in ["null", "zero", "random", "urandom", "tty"] {
-        ensure_device_node_from_host(&rootfs.join("dev").join(name), &Path::new("/dev").join(name))?;
+        ensure_device_node_from_host(
+            &rootfs.join("dev").join(name),
+            &Path::new("/dev").join(name),
+        )?;
     }
     ensure_symlink(rootfs.join("dev/fd"), Path::new("/proc/self/fd"))?;
     ensure_symlink(rootfs.join("dev/stdin"), Path::new("/proc/self/fd/0"))?;
@@ -1558,7 +1638,7 @@ fn ensure_symlink(path: PathBuf, target: &Path) -> Result<(), String> {
                 "Failed to inspect symlink path '{}': {}",
                 path.display(),
                 err
-            ))
+            ));
         }
     }
     std::os::unix::fs::symlink(target, &path)
@@ -1663,15 +1743,13 @@ impl BuildMountGuard {
             None::<&str>,
         ) {
             Ok(()) => true,
-            Err(err) if matches!(err, nix::Error::EINVAL | nix::Error::EPERM | nix::Error::EBUSY) => {
-                false
-            }
+            Err(nix::Error::EINVAL | nix::Error::EPERM | nix::Error::EBUSY) => false,
             Err(err) => {
                 return Err(format!(
                     "Failed to mount build /proc at '{}': {}",
                     proc_path.display(),
                     err
-                ))
+                ));
             }
         };
         Ok(Self {

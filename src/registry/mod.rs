@@ -16,7 +16,7 @@ mod auth;
 mod client;
 
 // Re-export only what's actively used
-pub use client::{PullEvent, PullOptions, PullProgress, RegistryClient};
+pub use client::{PullEvent, PullOptions, PullProgress, PushEvent, PushProgress, RegistryClient};
 
 use thiserror::Error;
 

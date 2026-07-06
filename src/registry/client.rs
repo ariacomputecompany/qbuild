@@ -7,10 +7,10 @@
 //! - HEAD /v2/<name>/blobs/<digest> - Check blob existence
 
 use crate::image::{
-    parse_manifest, ImageReference, ManifestKind, MediaType, OciImage, OciImageConfig, OciManifest,
+    ImageReference, ManifestKind, MediaType, OciImage, OciImageConfig, OciManifest, parse_manifest,
 };
-use crate::registry::{auth::RegistryAuth, RegistryError, Result};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use crate::registry::{RegistryError, Result, auth::RegistryAuth};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -49,6 +49,20 @@ pub enum PullEvent {
     /// Error occurred
     Error { message: String },
 }
+
+/// Events during image push
+#[derive(Debug, Clone)]
+pub enum PushEvent {
+    Started { reference: String },
+    UploadingBlob { digest: String, size: u64 },
+    BlobMounted { digest: String },
+    BlobUploaded { digest: String, size: u64 },
+    ManifestUploaded { digest: String },
+    Complete { reference: String, digest: String },
+}
+
+/// Progress callback for push operations
+pub type PushProgress = Box<dyn Fn(PushEvent) + Send + Sync>;
 
 /// Options for pull operations
 #[derive(Debug, Clone, Default)]
@@ -318,13 +332,13 @@ impl RegistryClient {
         let body = response.bytes().await?;
         use sha2::{Digest, Sha256};
         let computed_digest = format!("sha256:{:x}", Sha256::digest(&body));
-        if let Some(h) = &header_digest {
-            if h != &computed_digest {
-                eprintln!(
-                    "warning: manifest digest header/body mismatch for {}: header={}, computed={}",
-                    reference, h, computed_digest
-                );
-            }
+        if let Some(h) = &header_digest
+            && h != &computed_digest
+        {
+            eprintln!(
+                "warning: manifest digest header/body mismatch for {}: header={}, computed={}",
+                reference, h, computed_digest
+            );
         }
 
         // Parse manifest
@@ -379,22 +393,171 @@ impl RegistryClient {
         Ok(bytes.to_vec())
     }
 
-    /// Make an authenticated GET request
-    async fn authenticated_request(
+    /// Push a manifest, config, and layer blobs to a registry.
+    pub async fn push(
         &self,
+        reference: &ImageReference,
+        store: &crate::image::ImageStore,
+        manifest_digest: &str,
+        progress: Option<&PushProgress>,
+    ) -> Result<()> {
+        self.emit_push_progress(
+            progress,
+            PushEvent::Started {
+                reference: reference.to_string(),
+            },
+        );
+
+        let manifest_bytes = store.get_blob(manifest_digest)?;
+        let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
+        let config_bytes = store.get_blob(&manifest.config.digest)?;
+        self.upload_blob(reference, &manifest.config.digest, &config_bytes, progress)
+            .await?;
+
+        for layer in &manifest.layers {
+            let blob = store.get_blob(&layer.digest)?;
+            self.upload_blob(reference, &layer.digest, &blob, progress)
+                .await?;
+        }
+
+        let manifest_url = format!(
+            "{}/v2/{}/manifests/{}",
+            reference.api_endpoint(),
+            reference.repository,
+            reference.api_reference()
+        );
+        let content_type = manifest
+            .media_type
+            .clone()
+            .unwrap_or_else(|| MediaType::OciManifest.to_string());
+        self.authenticated_send(reqwest::Method::PUT, &manifest_url, reference, |request| {
+            request
+                .header(reqwest::header::CONTENT_TYPE, content_type.clone())
+                .body(manifest_bytes.clone())
+        })
+        .await?;
+
+        self.emit_push_progress(
+            progress,
+            PushEvent::ManifestUploaded {
+                digest: manifest_digest.to_string(),
+            },
+        );
+        self.emit_push_progress(
+            progress,
+            PushEvent::Complete {
+                reference: reference.to_string(),
+                digest: manifest_digest.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn upload_blob(
+        &self,
+        reference: &ImageReference,
+        digest: &str,
+        blob: &[u8],
+        progress: Option<&PushProgress>,
+    ) -> Result<()> {
+        self.emit_push_progress(
+            progress,
+            PushEvent::UploadingBlob {
+                digest: digest.to_string(),
+                size: blob.len() as u64,
+            },
+        );
+
+        if self.remote_blob_exists(reference, digest).await? {
+            self.emit_push_progress(
+                progress,
+                PushEvent::BlobMounted {
+                    digest: digest.to_string(),
+                },
+            );
+            return Ok(());
+        }
+
+        let start_url = format!(
+            "{}/v2/{}/blobs/uploads/",
+            reference.api_endpoint(),
+            reference.repository
+        );
+        let start_response = self
+            .authenticated_send(reqwest::Method::POST, &start_url, reference, |request| {
+                request
+            })
+            .await?;
+        let location = self.extract_location(&start_response, &start_url)?;
+        let upload_url = self.append_digest_query(&location, digest)?;
+
+        self.authenticated_send(reqwest::Method::PUT, &upload_url, reference, |request| {
+            request
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(blob.to_vec())
+        })
+        .await?;
+
+        self.emit_push_progress(
+            progress,
+            PushEvent::BlobUploaded {
+                digest: digest.to_string(),
+                size: blob.len() as u64,
+            },
+        );
+        Ok(())
+    }
+
+    async fn remote_blob_exists(&self, reference: &ImageReference, digest: &str) -> Result<bool> {
+        let url = format!(
+            "{}/v2/{}/blobs/{}",
+            reference.api_endpoint(),
+            reference.repository,
+            digest
+        );
+        let response = self
+            .authenticated_send(reqwest::Method::HEAD, &url, reference, |request| request)
+            .await?;
+        Ok(response.status().is_success())
+    }
+
+    /// Make an authenticated request
+    async fn authenticated_send<F>(
+        &self,
+        method: reqwest::Method,
         url: &str,
         reference: &ImageReference,
-        accept: &str,
-    ) -> Result<reqwest::Response> {
-        // First attempt without auth
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&self.user_agent).unwrap());
-        headers.insert(ACCEPT, HeaderValue::from_str(accept).unwrap());
+        mut configure: F,
+    ) -> Result<reqwest::Response>
+    where
+        F: FnMut(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    {
+        let build_headers = |accept: Option<&str>| -> Result<HeaderMap> {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                USER_AGENT,
+                HeaderValue::from_str(&self.user_agent)
+                    .map_err(|e| RegistryError::InvalidResponse(e.to_string()))?,
+            );
+            if let Some(accept) = accept {
+                headers.insert(
+                    ACCEPT,
+                    HeaderValue::from_str(accept)
+                        .map_err(|e| RegistryError::InvalidResponse(e.to_string()))?,
+                );
+            }
+            Ok(headers)
+        };
 
-        let response = self.http.get(url).headers(headers.clone()).send().await?;
+        let response = configure(
+            self.http
+                .request(method.clone(), url)
+                .headers(build_headers(None)?),
+        )
+        .send()
+        .await?;
 
         if response.status() == 401 {
-            // Need authentication
             let www_auth = response
                 .headers()
                 .get("www-authenticate")
@@ -404,13 +567,16 @@ impl RegistryClient {
                 })?;
 
             let token = self.auth.get_token(www_auth, &reference.registry).await?;
-
+            let mut headers = build_headers(None)?;
             headers.insert(
                 AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+                HeaderValue::from_str(&format!("Bearer {}", token))
+                    .map_err(|e| RegistryError::InvalidResponse(e.to_string()))?,
             );
 
-            let response = self.http.get(url).headers(headers).send().await?;
+            let response = configure(self.http.request(method, url).headers(headers))
+                .send()
+                .await?;
 
             if !response.status().is_success() {
                 if response.status() == 404 {
@@ -434,7 +600,9 @@ impl RegistryClient {
             }
 
             Ok(response)
-        } else if response.status().is_success() {
+        } else if response.status().is_success()
+            || (response.status() == 404 && method == reqwest::Method::HEAD)
+        {
             Ok(response)
         } else if response.status() == 404 {
             Err(RegistryError::ManifestNotFound(url.to_string()))
@@ -447,8 +615,27 @@ impl RegistryClient {
         }
     }
 
+    /// Make an authenticated GET request
+    async fn authenticated_request(
+        &self,
+        url: &str,
+        reference: &ImageReference,
+        accept: &str,
+    ) -> Result<reqwest::Response> {
+        self.authenticated_send(reqwest::Method::GET, url, reference, |request| {
+            request.header(ACCEPT, accept)
+        })
+        .await
+    }
+
     /// Emit a progress event
     fn emit_progress(&self, progress: Option<&PullProgress>, event: PullEvent) {
+        if let Some(cb) = progress {
+            cb(event);
+        }
+    }
+
+    fn emit_push_progress(&self, progress: Option<&PushProgress>, event: PushEvent) {
         if let Some(cb) = progress {
             cb(event);
         }
@@ -461,6 +648,31 @@ impl RegistryClient {
             auth: self.auth.clone(),
             user_agent: self.user_agent.clone(),
         }
+    }
+
+    fn extract_location(&self, response: &reqwest::Response, fallback: &str) -> Result<String> {
+        let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+            return Ok(fallback.to_string());
+        };
+        let location = location
+            .to_str()
+            .map_err(|e| RegistryError::InvalidResponse(e.to_string()))?;
+        if location.starts_with("http://") || location.starts_with("https://") {
+            return Ok(location.to_string());
+        }
+        let base = reqwest::Url::parse(fallback)
+            .map_err(|e| RegistryError::InvalidResponse(e.to_string()))?;
+        let resolved = base
+            .join(location)
+            .map_err(|e| RegistryError::InvalidResponse(e.to_string()))?;
+        Ok(resolved.to_string())
+    }
+
+    fn append_digest_query(&self, location: &str, digest: &str) -> Result<String> {
+        let mut url = reqwest::Url::parse(location)
+            .map_err(|e| RegistryError::InvalidResponse(e.to_string()))?;
+        url.query_pairs_mut().append_pair("digest", digest);
+        Ok(url.to_string())
     }
 }
 

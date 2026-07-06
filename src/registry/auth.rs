@@ -115,10 +115,10 @@ impl RegistryAuth {
             let tokens = self.tokens.read().map_err(|e| {
                 RegistryError::AuthError(format!("Failed to acquire read lock: {}", e))
             })?;
-            if let Some(token) = tokens.get(&cache_key) {
-                if token.is_valid() {
-                    return Ok(token.token.clone());
-                }
+            if let Some(token) = tokens.get(&cache_key)
+                && token.is_valid()
+            {
+                return Ok(token.token.clone());
             }
         }
 
@@ -310,19 +310,16 @@ fn decode_docker_auth(entry: &DockerAuthEntry) -> Option<Credentials> {
     }
 
     // Try base64-encoded auth
-    if let Some(auth) = &entry.auth {
-        if let Ok(decoded) =
+    if let Some(auth) = &entry.auth
+        && let Ok(decoded) =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, auth)
-        {
-            if let Ok(s) = String::from_utf8(decoded) {
-                if let Some((username, password)) = s.split_once(':') {
-                    return Some(Credentials {
-                        username: username.to_string(),
-                        password: password.to_string(),
-                    });
-                }
-            }
-        }
+        && let Ok(s) = String::from_utf8(decoded)
+        && let Some((username, password)) = s.split_once(':')
+    {
+        return Some(Credentials {
+            username: username.to_string(),
+            password: password.to_string(),
+        });
     }
 
     // Try identity token

@@ -18,7 +18,7 @@ mod store;
 
 // Re-export items used by other modules
 pub use config::{EmptyObject, History, OciContainerConfig, OciImageConfig, RootFs};
-pub use manifest::{parse_manifest, Descriptor, ManifestKind, MediaType, OciManifest};
+pub use manifest::{Descriptor, ManifestKind, MediaType, OciManifest, parse_manifest};
 pub use reference::ImageReference;
 pub use store::ImageStore;
 
