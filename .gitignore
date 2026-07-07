@@ -1,1 +1,4 @@
 /target
+/.cache/
+/packaging/macos-guest/out/
+/tools/macos-supervisor/.build/

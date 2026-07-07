@@ -1,6 +1,7 @@
-use crate::runtime::{NamespaceConfig, ResourceLimits, RunRequest, RunResult, RunService};
+use crate::protocol::{ContainerState, NamespaceConfig, ResourceLimits};
+use crate::runtime::{RunRequest, RunResult, RunService};
 use chrono::Utc;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,15 +10,6 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ContainerState {
-    Created,
-    Starting,
-    Running,
-    Exited,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerRecord {
@@ -68,8 +60,13 @@ pub struct ContainerStore {
 impl ContainerStore {
     pub fn new(data_root: impl AsRef<Path>, store_dir: impl AsRef<Path>) -> Result<Self, String> {
         let root = data_root.as_ref().join("containers");
-        std::fs::create_dir_all(&root)
-            .map_err(|e| format!("Failed to create container store '{}': {}", root.display(), e))?;
+        std::fs::create_dir_all(&root).map_err(|e| {
+            format!(
+                "Failed to create container store '{}': {}",
+                root.display(),
+                e
+            )
+        })?;
         Ok(Self {
             root,
             store_dir: store_dir.as_ref().to_path_buf(),
@@ -103,17 +100,31 @@ impl ContainerStore {
 
     pub fn load(&self, id: &str) -> Result<ContainerRecord, String> {
         let path = self.record_path(id);
-        let bytes = std::fs::read(&path)
-            .map_err(|e| format!("Failed to read container record '{}': {}", path.display(), e))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| format!("Failed to decode container record '{}': {}", path.display(), e))
+        let bytes = std::fs::read(&path).map_err(|e| {
+            format!(
+                "Failed to read container record '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
+        serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "Failed to decode container record '{}': {}",
+                path.display(),
+                e
+            )
+        })
     }
 
     pub fn list(&self) -> Result<Vec<ContainerSummary>, String> {
         let mut items = Vec::new();
-        for entry in std::fs::read_dir(&self.root)
-            .map_err(|e| format!("Failed to list container store '{}': {}", self.root.display(), e))?
-        {
+        for entry in std::fs::read_dir(&self.root).map_err(|e| {
+            format!(
+                "Failed to list container store '{}': {}",
+                self.root.display(),
+                e
+            )
+        })? {
             let entry = entry.map_err(|e| format!("Failed to read container dir entry: {}", e))?;
             if !entry
                 .file_type()
@@ -143,7 +154,10 @@ impl ContainerStore {
     pub fn start(&self, id: &str) -> Result<ContainerRecord, String> {
         let mut record = self.load(id)?;
         self.refresh_state(&mut record)?;
-        if matches!(record.state, ContainerState::Starting | ContainerState::Running) {
+        if matches!(
+            record.state,
+            ContainerState::Starting | ContainerState::Running
+        ) {
             return Err(format!("Container '{}' is already {:?}", id, record.state));
         }
 
@@ -212,7 +226,10 @@ impl ContainerStore {
     pub fn remove(&self, id: &str) -> Result<(), String> {
         let mut record = self.load(id)?;
         self.refresh_state(&mut record)?;
-        if matches!(record.state, ContainerState::Starting | ContainerState::Running) {
+        if matches!(
+            record.state,
+            ContainerState::Starting | ContainerState::Running
+        ) {
             return Err(format!("Container '{}' is still {:?}", id, record.state));
         }
         std::fs::remove_dir_all(self.container_dir(id)).map_err(|e| {
@@ -247,19 +264,21 @@ impl ContainerStore {
         self.write_record(&record)?;
 
         let service = RunService::new();
-        let result = service.run(RunRequest {
-            image_reference: record.image_reference.clone(),
-            command: record.command.clone(),
-            environment: record.environment.clone(),
-            working_directory: record.working_directory.clone(),
-            store_dir: self.store_dir.clone(),
-            namespace_config: record.namespace_config.clone(),
-            resource_limits: record.resource_limits.clone(),
-            clear_image_env: record.clear_image_env,
-            container_id: Some(record.id.clone()),
-            status_file: Some(self.status_path(&record.id)),
-            started_at: record.started_at,
-        }).await;
+        let result = service
+            .run(RunRequest {
+                image_reference: record.image_reference.clone(),
+                command: record.command.clone(),
+                environment: record.environment.clone(),
+                working_directory: record.working_directory.clone(),
+                store_dir: self.store_dir.clone(),
+                namespace_config: record.namespace_config.clone(),
+                resource_limits: record.resource_limits.clone(),
+                clear_image_env: record.clear_image_env,
+                container_id: Some(record.id.clone()),
+                status_file: Some(self.status_path(&record.id)),
+                started_at: record.started_at,
+            })
+            .await;
 
         match result {
             Ok(result) => {
@@ -300,8 +319,10 @@ impl ContainerStore {
             return Ok(());
         }
 
-        if matches!(record.state, ContainerState::Starting | ContainerState::Running)
-            && let Some(pid) = record.pid
+        if matches!(
+            record.state,
+            ContainerState::Starting | ContainerState::Running
+        ) && let Some(pid) = record.pid
             && !process_exists(pid)
         {
             record.state = ContainerState::Exited;
@@ -321,16 +342,26 @@ impl ContainerStore {
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|e| format!("Failed to encode container record '{}': {}", record.id, e))?;
         let path = self.record_path(&record.id);
-        std::fs::write(&path, bytes)
-            .map_err(|e| format!("Failed to write container record '{}': {}", path.display(), e))
+        std::fs::write(&path, bytes).map_err(|e| {
+            format!(
+                "Failed to write container record '{}': {}",
+                path.display(),
+                e
+            )
+        })
     }
 
     fn write_status(&self, status: &ExecStatusFile) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(status)
             .map_err(|e| format!("Failed to encode container status '{}': {}", status.id, e))?;
         let path = self.status_path(&status.id);
-        std::fs::write(&path, bytes)
-            .map_err(|e| format!("Failed to write container status '{}': {}", path.display(), e))
+        std::fs::write(&path, bytes).map_err(|e| {
+            format!(
+                "Failed to write container status '{}': {}",
+                path.display(),
+                e
+            )
+        })
     }
 
     fn container_dir(&self, id: &str) -> PathBuf {

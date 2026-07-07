@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "platform": "linux/arm64",
+  "kernel": "vmlinux",
+  "init_block": "init.block",
+  "guest_rootfs": "guest-rootfs.ext4",
+  "guestd_socket_path": "/run/qbuild/guestd.sock",
+  "guestd_binary_path": "/usr/local/bin/qbuild"
+}

@@ -8,7 +8,7 @@
 
 use crate::image::{ImageError, Result};
 use flate2::read::GzDecoder;
-use nix::mount::{umount2, MntFlags};
+use nix::mount::{MntFlags, umount2};
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;

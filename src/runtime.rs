@@ -1,39 +1,13 @@
 use crate::image::{ImageManager, ImageReference, OciImage};
-use nix::mount::{mount, MsFlags};
+use crate::protocol::{NamespaceConfig, ResourceLimits};
+use nix::mount::{MsFlags, mount};
 use nix::sched::CloneFlags;
-use nix::unistd::{chdir, chroot, setpgid, Gid, Pid, Uid};
+use nix::unistd::{Gid, Pid, Uid, chdir, chroot, setpgid};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NamespaceConfig {
-    pub mount: bool,
-    pub uts: bool,
-    pub ipc: bool,
-    pub network: bool,
-}
-
-impl Default for NamespaceConfig {
-    fn default() -> Self {
-        Self {
-            mount: true,
-            uts: false,
-            ipc: false,
-            network: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct ResourceLimits {
-    pub memory_limit_bytes: Option<u64>,
-    pub cpu_quota: Option<i64>,
-    pub cpu_period: Option<u64>,
-    pub pids_limit: Option<u64>,
-}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunRequest {
@@ -66,8 +40,12 @@ impl RunService {
 
         let image_manager = ImageManager::new(&request.store_dir)
             .map_err(|e| format!("Failed to initialize image manager: {}", e))?;
-        let reference = ImageReference::parse(&request.image_reference)
-            .map_err(|e| format!("Invalid image reference '{}': {}", request.image_reference, e))?;
+        let reference = ImageReference::parse(&request.image_reference).map_err(|e| {
+            format!(
+                "Invalid image reference '{}': {}",
+                request.image_reference, e
+            )
+        })?;
         let store = crate::image::ImageStore::new(&request.store_dir)
             .map_err(|e| format!("Failed to initialize image store: {}", e))?;
         let manifest_digest = store
@@ -108,7 +86,11 @@ impl RunService {
             let _ = manager.destroy();
         }
         if let Err(err) = cleanup_result {
-            eprintln!("warning: failed to cleanup rootfs {}: {}", rootfs.display(), err);
+            eprintln!(
+                "warning: failed to cleanup rootfs {}: {}",
+                rootfs.display(),
+                err
+            );
         }
 
         result
@@ -160,8 +142,7 @@ impl RunService {
                 chdir("/").map_err(|e| std::io::Error::other(e.to_string()))?;
 
                 if mount_namespace {
-                    mount_proc_inside_rootfs()
-                        .map_err(std::io::Error::other)?;
+                    mount_proc_inside_rootfs().map_err(std::io::Error::other)?;
                 }
 
                 chdir(workdir_clone.as_str()).map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -224,8 +205,13 @@ fn write_runtime_status(path: &Path, pid: u32, started_at: Option<i64>) -> Resul
         started_at,
         finished_at: None,
     };
-    let bytes = serde_json::to_vec_pretty(&payload)
-        .map_err(|e| format!("Failed to encode runtime status '{}': {}", path.display(), e))?;
+    let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| {
+        format!(
+            "Failed to encode runtime status '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
     std::fs::write(path, bytes)
         .map_err(|e| format!("Failed to write runtime status '{}': {}", path.display(), e))
 }
@@ -313,7 +299,10 @@ fn prepare_runtime_rootfs(rootfs: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to create /proc in runtime rootfs: {}", e))?;
 
     for name in ["null", "zero", "random", "urandom", "tty"] {
-        ensure_device_node_from_host(&rootfs.join("dev").join(name), &Path::new("/dev").join(name))?;
+        ensure_device_node_from_host(
+            &rootfs.join("dev").join(name),
+            &Path::new("/dev").join(name),
+        )?;
     }
     ensure_symlink(rootfs.join("dev/fd"), Path::new("/proc/self/fd"))?;
     ensure_symlink(rootfs.join("dev/stdin"), Path::new("/proc/self/fd/0"))?;
@@ -351,7 +340,7 @@ fn ensure_symlink(path: PathBuf, target: &Path) -> Result<(), String> {
                 "Failed to inspect symlink path '{}': {}",
                 path.display(),
                 err
-            ))
+            ));
         }
     }
     std::os::unix::fs::symlink(target, &path)
@@ -407,7 +396,12 @@ fn resolve_user(rootfs: &Path, user_spec: &str) -> Result<Option<(u32, u32)>, St
                 None
             }
         })
-        .ok_or_else(|| format!("Failed to resolve runtime user '{}' inside image", user_part))?;
+        .ok_or_else(|| {
+            format!(
+                "Failed to resolve runtime user '{}' inside image",
+                user_part
+            )
+        })?;
     let gid = group
         .lines()
         .find_map(|line| {
@@ -478,8 +472,13 @@ impl CgroupManager {
 
     fn create_v2(&self) -> Result<(), String> {
         let parent = self.root.join("qbuild");
-        std::fs::create_dir_all(&parent)
-            .map_err(|e| format!("Failed to create cgroup parent '{}': {}", parent.display(), e))?;
+        std::fs::create_dir_all(&parent).map_err(|e| {
+            format!(
+                "Failed to create cgroup parent '{}': {}",
+                parent.display(),
+                e
+            )
+        })?;
         let _ = std::fs::write(parent.join("cgroup.subtree_control"), "+memory +cpu +pids");
         let dir = parent.join(&self.id);
         std::fs::create_dir_all(&dir)

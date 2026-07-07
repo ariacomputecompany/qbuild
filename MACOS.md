@@ -23,6 +23,25 @@ Use Apple `containerization` only as the substrate for:
 
 Everything performance-critical stays in Linux.
 
+## Current Implementation
+
+The codebase now enforces an explicit platform split:
+
+- `src/platform/linux_local.rs`
+- `src/platform/macos_host.rs`
+- `src/guestd.rs`
+- `src/services.rs`
+- `src/protocol.rs`
+
+That split creates three real modes:
+
+1. Linux local CLI mode
+2. Linux guest daemon mode via `qbuild guestd`
+3. macOS host-control mode that forwards commands to the guest daemon
+
+The host/guest request surface is typed and high-level. On macOS, the host now
+targets a supervisor-managed Unix socket relay backed by the persistent guest.
+
 ## Why
 
 The current `qbuild` implementation is Linux-native:
@@ -109,6 +128,43 @@ Recommended process model:
 The guest daemon should be the execution authority.
 
 The host CLI should be a control client.
+
+## Implemented RPC Surface
+
+The daemon currently accepts high-level command requests for:
+
+- `build`
+- `pull`
+- `push`
+- `inspect`
+- `list`
+- `run`
+- `create`
+- `start`
+- `stop`
+- `rm`
+- `ps`
+- `logs`
+
+Responses are explicit and typed, and progress/status messages are streamed back
+as daemon events during long-running operations like `build`, `pull`, and
+`push`.
+
+## Current Host Contract
+
+The macOS host now targets a fixed local supervisor state directory under
+`~/.qbuild/macos`.
+
+For each CLI invocation, the macOS host:
+
+1. Resolves the bundled macOS supervisor binary and guest assets
+2. Ensures the supervisor daemon is running
+3. Waits for the relayed host Unix socket for guestd to become healthy
+4. Forwards the requested high-level command
+5. Prints streamed progress and the final command result
+
+The supervisor is responsible for maintaining the persistent Linux guest and the
+host-facing Unix socket relay.
 
 ## Why Not Apple `container build`
 

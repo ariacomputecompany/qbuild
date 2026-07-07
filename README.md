@@ -57,12 +57,31 @@ cargo build --release
 ./target/release/qbuild --help
 ```
 
+On Linux, the resulting binary can execute builds and containers directly.
+
+On macOS, the binary runs in host-control mode. It starts or reconnects to a
+persistent Linux guest managed by a local supervisor, then forwards the normal
+`qbuild` commands to the guest daemon instead of trying to reproduce the Linux
+runtime on Darwin.
+
 ## Usage
 
 Build an image from a local context:
 
 ```bash
 qbuild build . --image local.test/my-app:latest
+```
+
+Run the Linux guest daemon directly on Linux:
+
+```bash
+qbuild guestd --listen 127.0.0.1:42141
+```
+
+Run the Linux guest daemon on a Unix socket inside a guest:
+
+```bash
+qbuild guestd --listen-unix /run/qbuild/guestd.sock
 ```
 
 Pull a standard base image:
@@ -123,6 +142,36 @@ qbuild build ./app \
 Builds that execute `RUN` steps currently rely on low-level Linux container primitives. `qbuild` performs a preflight check and fails fast when the current environment cannot support that execution model.
 
 Local image `run`, and persistent container `start` and `stop`, currently require root privileges in the current runtime model.
+
+On macOS, those privileged operations still execute inside the Linux guest. The
+macOS host process only forwards the request and renders progress/output.
+
+## Platform Modes
+
+`qbuild` now has three explicit execution modes:
+
+- Linux local mode: the CLI executes the existing build/runtime engine in
+  process.
+- Linux guest daemon mode: `qbuild guestd` exposes a typed RPC surface over a
+  long-lived TCP or Unix control channel.
+- macOS host mode: the CLI ensures a local supervisor-managed Linux guest,
+  waits for the relayed Unix socket to become healthy, and forwards the regular
+  command set.
+
+The guest RPC surface covers:
+
+- `build`
+- `pull`
+- `push`
+- `inspect`
+- `list`
+- `run`
+- `create`
+- `start`
+- `stop`
+- `rm`
+- `ps`
+- `logs`
 
 ## Verification
 
