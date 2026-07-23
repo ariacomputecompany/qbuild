@@ -1,5 +1,7 @@
 mod cli;
 mod error;
+#[cfg(target_os = "linux")]
+mod gpu;
 mod platform;
 mod protocol;
 

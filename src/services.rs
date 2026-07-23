@@ -7,10 +7,10 @@ use crate::containers::{ContainerStore, CreateContainerRequest};
 use crate::error::AppError;
 use crate::image::{ImageReference, ImageStore, OciManifest};
 use crate::protocol::{
-    BindMountSpec, BuildOutput, CommandRequest, ContainerSummaryOutput, CreateOutput, GuestEvent,
-    GuestResponse, ImageReferenceOutput, InspectOutput, ListOutput, LogsOutput, NamespaceConfig,
-    PsOutput, PullOutput, PushOutput, RemoveOutput, ResourceLimits, RunOutput, StartOutput,
-    StopOutput,
+    BindMountSpec, BuildOutput, CommandRequest, ContainerSummaryOutput, CreateOutput, GpuRequest,
+    GuestEvent, GuestResponse, ImageReferenceOutput, InspectOutput, ListOutput, LogsOutput,
+    NamespaceConfig, PsOutput, PullOutput, PushOutput, RemoveOutput, ResourceLimits, RunOutput,
+    StartOutput, StopOutput,
 };
 use crate::registry::{PullEvent, PullOptions, PushEvent, RegistryClient};
 use crate::runtime::{RunRequest, RunService};
@@ -163,6 +163,7 @@ async fn run(cmd: RunCommand) -> Result<RunOutput, AppError> {
             },
             mounts: parse_mounts(&cmd.mounts)?,
             resource_limits: build_limits(cmd.memory_mb, cmd.cpu_percent, cmd.pids_limit),
+            gpu_request: build_gpu_request(cmd.gpu_count, cmd.gpu_ids)?,
             clear_image_env: cmd.clear_image_env,
             container_id,
             status_file: None,
@@ -194,6 +195,7 @@ fn create(cmd: CreateCommand) -> Result<CreateOutput, AppError> {
             },
             mounts: parse_mounts(&cmd.mounts)?,
             resource_limits: build_limits(cmd.memory_mb, cmd.cpu_percent, cmd.pids_limit),
+            gpu_request: build_gpu_request(cmd.gpu_count, cmd.gpu_ids)?,
             clear_image_env: cmd.clear_image_env,
         })
         .map_err(AppError::Message)?;
@@ -326,6 +328,15 @@ fn parse_key_values(values: &[String], kind: &str) -> Result<HashMap<String, Str
     Ok(items)
 }
 
+fn build_gpu_request(count: Option<u32>, device_ids: Vec<String>) -> Result<GpuRequest, AppError> {
+    let request = GpuRequest {
+        count: count.unwrap_or(0),
+        device_ids,
+    };
+    request.validate().map_err(AppError::Message)?;
+    Ok(request)
+}
+
 fn parse_mounts(values: &[String]) -> Result<Vec<BindMountSpec>, AppError> {
     values
         .iter()
@@ -345,6 +356,8 @@ fn parse_mounts(values: &[String]) -> Result<Vec<BindMountSpec>, AppError> {
                     value
                 )));
             }
+            reject_user_gpu_device_mount(source)?;
+            reject_user_gpu_device_mount(target)?;
             let readonly = match parts.get(2).map(|mode| mode.trim()) {
                 None | Some("") | Some("rw") => false,
                 Some("ro") => true,
@@ -362,6 +375,21 @@ fn parse_mounts(values: &[String]) -> Result<Vec<BindMountSpec>, AppError> {
             })
         })
         .collect()
+}
+
+fn reject_user_gpu_device_mount(path: &str) -> Result<(), AppError> {
+    if path == "/dev/kfd"
+        || path == "/dev/dxg"
+        || path == "/dev/dri"
+        || path.starts_with("/dev/dri/")
+        || path.starts_with("/dev/nvidia")
+    {
+        return Err(AppError::Message(
+            "raw GPU device mounts are managed by qbuild; use --gpu-count/--gpu-id instead"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_container_name(name: Option<&str>) -> Result<Option<&str>, AppError> {
@@ -508,6 +536,20 @@ mod tests {
         let err = parse_mounts(&["/host:/container:shared".to_string()])
             .expect_err("unknown mount mode should fail");
         assert!(err.to_string().contains("expected ro or rw"));
+    }
+
+    #[test]
+    fn parse_mounts_rejects_raw_gpu_device_mounts() {
+        let err = parse_mounts(&["/dev/kfd:/dev/kfd".to_string()])
+            .expect_err("raw gpu mounts should fail");
+        assert!(err.to_string().contains("--gpu-count"));
+    }
+
+    #[test]
+    fn build_gpu_request_validates_count_and_ids() {
+        let err = build_gpu_request(Some(1), vec!["nvidia0".to_string(), "nvidia1".to_string()])
+            .expect_err("mismatched gpu count should fail");
+        assert!(err.to_string().contains("gpu_count"));
     }
 
     #[test]

@@ -25,6 +25,37 @@ impl Default for NamespaceConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuRequest {
+    pub count: u32,
+    pub device_ids: Vec<String>,
+}
+
+impl GpuRequest {
+    pub fn is_enabled(&self) -> bool {
+        self.count > 0
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.count == 0 && !self.device_ids.is_empty() {
+            return Err("gpu_ids require gpu_count > 0".to_string());
+        }
+        if !self.device_ids.is_empty() && self.count as usize != self.device_ids.len() {
+            return Err("gpu_count must exactly match gpu_ids length".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for id in &self.device_ids {
+            if id.trim().is_empty() {
+                return Err("gpu_ids cannot contain empty values".to_string());
+            }
+            if !seen.insert(id) {
+                return Err(format!("duplicate gpu_id '{}'", id));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub memory_limit_bytes: Option<u64>,

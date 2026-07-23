@@ -19,6 +19,7 @@ That means `qbuild` works for Quilt image workflows and standard Docker-compatib
 - Runs locally stored images
 - Creates and manages persistent local containers
 - Stores image content, metadata, and runtime state locally
+- Injects trusted local GPU devices through first-class runtime flags
 - Inspects and lists local images and containers
 
 ## What it is not
@@ -131,6 +132,23 @@ Bind host state into a container:
 qbuild create local.test/my-app:latest --name my-app -v /host/workspace:/workspace:rw
 qbuild create local.test/my-app:latest --name my-app -v /host/cache:/cache:ro
 ```
+
+Request local GPU passthrough:
+
+```bash
+sudo qbuild run local.test/gpu-app:latest --gpu-count 1
+qbuild create local.test/gpu-app:latest --name gpu-app --gpu-count 1
+qbuild create local.test/gpu-app:latest --name gpu-app --gpu-count 1 --gpu-id amd0
+qbuild create local.test/gpu-app:latest --name gpu-app --gpu-count 1 --gpu-id nvidia0
+```
+
+GPU access is intentionally not modeled as user-supplied raw `/dev/*` mounts.
+`qbuild` validates the `--gpu-count`/`--gpu-id` request, discovers the local
+NVIDIA or AMD/ROCm device surface, and injects only the trusted device mounts
+and runtime visibility environment needed by the selected vendor. NVIDIA hosts
+receive CUDA/NVIDIA visibility env and `/dev/nvidia*` control/device mounts;
+AMD hosts receive ROCm visibility env and either `/dev/kfd` + `/dev/dri` or the
+WSL `/dev/dxg` runtime surface.
 
 Build with explicit paths:
 

@@ -1,4 +1,4 @@
-use crate::protocol::{BindMountSpec, ContainerState, NamespaceConfig, ResourceLimits};
+use crate::protocol::{BindMountSpec, ContainerState, GpuRequest, NamespaceConfig, ResourceLimits};
 use crate::runtime::{RunRequest, RunResult, RunService};
 use chrono::Utc;
 use nix::sys::signal::{Signal, kill};
@@ -24,6 +24,7 @@ pub struct ContainerRecord {
     pub namespace_config: NamespaceConfig,
     pub mounts: Vec<BindMountSpec>,
     pub resource_limits: Option<ResourceLimits>,
+    pub gpu_request: GpuRequest,
     pub clear_image_env: bool,
     pub state: ContainerState,
     pub pid: Option<u32>,
@@ -56,6 +57,7 @@ pub struct CreateContainerRequest {
     pub namespace_config: NamespaceConfig,
     pub mounts: Vec<BindMountSpec>,
     pub resource_limits: Option<ResourceLimits>,
+    pub gpu_request: GpuRequest,
     pub clear_image_env: bool,
 }
 
@@ -101,6 +103,7 @@ impl ContainerStore {
             namespace_config: request.namespace_config,
             mounts: request.mounts,
             resource_limits: request.resource_limits,
+            gpu_request: request.gpu_request,
             clear_image_env: request.clear_image_env,
             state: ContainerState::Created,
             pid: None,
@@ -304,6 +307,7 @@ impl ContainerStore {
                 store_dir: self.store_dir.clone(),
                 namespace_config: record.namespace_config.clone(),
                 resource_limits: record.resource_limits.clone(),
+                gpu_request: record.gpu_request.clone(),
                 mounts: record.mounts.clone(),
                 clear_image_env: record.clear_image_env,
                 container_id: Some(record.id.clone()),

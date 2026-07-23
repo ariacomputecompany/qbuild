@@ -109,6 +109,10 @@ pub struct RunCommand {
     #[arg(long)]
     pub pids_limit: Option<u64>,
     #[arg(long)]
+    pub gpu_count: Option<u32>,
+    #[arg(long = "gpu-id")]
+    pub gpu_ids: Vec<String>,
+    #[arg(long)]
     pub clear_image_env: bool,
     #[arg(long)]
     pub no_mount_namespace: bool,
@@ -143,6 +147,10 @@ pub struct CreateCommand {
     pub cpu_percent: Option<f64>,
     #[arg(long)]
     pub pids_limit: Option<u64>,
+    #[arg(long)]
+    pub gpu_count: Option<u32>,
+    #[arg(long = "gpu-id")]
+    pub gpu_ids: Vec<String>,
     #[arg(long)]
     pub clear_image_env: bool,
     #[arg(long)]

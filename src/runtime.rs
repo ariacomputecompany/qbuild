@@ -1,11 +1,13 @@
+use crate::gpu::prepare_gpu_runtime;
 use crate::image::{ImageManager, ImageReference, OciImage};
-use crate::protocol::{BindMountSpec, NamespaceConfig, ResourceLimits};
-use nix::mount::{MsFlags, mount};
+use crate::protocol::{BindMountSpec, GpuRequest, NamespaceConfig, ResourceLimits};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::CloneFlags;
 use nix::unistd::{Gid, Pid, Uid, chdir, chroot, setpgid};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -19,6 +21,7 @@ pub struct RunRequest {
     pub store_dir: PathBuf,
     pub namespace_config: NamespaceConfig,
     pub resource_limits: Option<ResourceLimits>,
+    pub gpu_request: GpuRequest,
     pub clear_image_env: bool,
     pub mounts: Vec<BindMountSpec>,
     pub container_id: Option<String>,
@@ -106,7 +109,9 @@ impl RunService {
         cgroups: Option<&CgroupManager>,
     ) -> Result<RunResult, String> {
         let command = resolve_runtime_command(image, &request.command, rootfs)?;
-        let env = resolve_runtime_env(image, &request.environment, request.clear_image_env);
+        let gpu_runtime = prepare_gpu_runtime(&request.gpu_request)?;
+        let mut env = resolve_runtime_env(image, &request.environment, request.clear_image_env);
+        env.extend(gpu_runtime.env);
         let workdir = request
             .working_directory
             .clone()
@@ -121,7 +126,8 @@ impl RunService {
                     .to_string(),
             );
         }
-        let mounts = request.mounts.clone();
+        let mut mounts = request.mounts.clone();
+        mounts.extend(gpu_runtime.mounts);
 
         let rootfs = rootfs.to_path_buf();
         let workdir_clone = workdir.clone();
@@ -147,6 +153,9 @@ impl RunService {
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                 prepare_runtime_rootfs(&rootfs).map_err(std::io::Error::other)?;
+                if mount_namespace {
+                    bind_standard_devices(&rootfs).map_err(std::io::Error::other)?;
+                }
                 apply_bind_mounts(&rootfs, &mounts).map_err(std::io::Error::other)?;
                 chroot(&rootfs).map_err(|e| std::io::Error::other(e.to_string()))?;
                 chdir("/").map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -333,6 +342,34 @@ fn mount_proc_inside_rootfs() -> Result<(), String> {
     .map_err(|e| format!("Failed to mount /proc in runtime: {}", e))
 }
 
+fn bind_standard_devices(rootfs: &Path) -> Result<(), String> {
+    let mut mounted = Vec::new();
+    for name in ["null", "zero", "random", "urandom", "tty"] {
+        let target = rootfs.join("dev").join(name);
+        let source = Path::new("/dev").join(name);
+        mount(
+            Some(source.as_path()),
+            target.as_path(),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            for mounted_path in mounted.iter().rev() {
+                let _ = umount2(mounted_path, MntFlags::MNT_DETACH);
+            }
+            format!(
+                "Failed to bind trusted runtime device '{}' to '{}': {}",
+                source.display(),
+                target.display(),
+                e
+            )
+        })?;
+        mounted.push(target);
+    }
+    Ok(())
+}
+
 fn apply_bind_mounts(rootfs: &Path, mounts: &[BindMountSpec]) -> Result<(), String> {
     for spec in mounts {
         let source = std::fs::canonicalize(&spec.source).map_err(|e| {
@@ -363,6 +400,17 @@ fn apply_bind_mounts(rootfs: &Path, mounts: &[BindMountSpec]) -> Result<(), Stri
                     e
                 )
             })?;
+        } else if metadata.file_type().is_char_device() || metadata.file_type().is_block_device() {
+            if let Some(parent) = host_target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed to create bind mount device target parent '{}': {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+            }
+            ensure_device_node_from_host(&host_target, &source)?;
         } else if metadata.is_file() {
             if let Some(parent) = host_target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -447,9 +495,6 @@ fn ensure_symlink(path: PathBuf, target: &Path) -> Result<(), String> {
 }
 
 fn ensure_device_node_from_host(target: &Path, source: &Path) -> Result<(), String> {
-    if target.exists() {
-        return Ok(());
-    }
     let metadata = std::fs::symlink_metadata(source).map_err(|e| {
         format!(
             "Failed to read device metadata for '{}': {}",
@@ -457,11 +502,30 @@ fn ensure_device_node_from_host(target: &Path, source: &Path) -> Result<(), Stri
             e
         )
     })?;
+    let expected_mode = metadata.mode() as libc::mode_t;
+    let expected_dev = metadata.rdev() as libc::dev_t;
+
+    if let Ok(existing) = std::fs::symlink_metadata(target) {
+        if existing.file_type().is_char_device() && existing.rdev() == metadata.rdev() {
+            std::fs::set_permissions(
+                target,
+                std::fs::Permissions::from_mode(metadata.mode() & 0o7777),
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to normalize device node permissions '{}': {}",
+                    target.display(),
+                    e
+                )
+            })?;
+            return Ok(());
+        }
+        remove_existing_device_placeholder(target, &existing)?;
+    }
+
     let c_path = std::ffi::CString::new(target.as_os_str().as_encoded_bytes())
         .map_err(|_| format!("Invalid device node path '{}'", target.display()))?;
-    let mode = std::os::unix::fs::MetadataExt::mode(&metadata) as libc::mode_t;
-    let dev = std::os::unix::fs::MetadataExt::rdev(&metadata) as libc::dev_t;
-    let result = unsafe { libc::mknod(c_path.as_ptr(), mode, dev) };
+    let result = unsafe { libc::mknod(c_path.as_ptr(), expected_mode, expected_dev) };
     if result != 0 {
         return Err(format!(
             "Failed to create device node '{}': {}",
@@ -470,6 +534,19 @@ fn ensure_device_node_from_host(target: &Path, source: &Path) -> Result<(), Stri
         ));
     }
     Ok(())
+}
+
+fn remove_existing_device_placeholder(
+    target: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), String> {
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(target)
+            .map_err(|e| format!("Failed to replace directory '{}': {}", target.display(), e))
+    } else {
+        std::fs::remove_file(target)
+            .map_err(|e| format!("Failed to replace file '{}': {}", target.display(), e))
+    }
 }
 
 fn resolve_user(rootfs: &Path, user_spec: &str) -> Result<Option<(u32, u32)>, String> {

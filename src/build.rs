@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -854,12 +854,12 @@ fn execute_run(
     let _apt_guard = BuildAptGuard::new(rootfs)?;
     let _mount_guard = BuildMountGuard::new(rootfs)?;
     let rootfs = rootfs.to_path_buf();
-    let host_workdir = host_workdir.clone();
+    let container_workdir = workdir.to_string();
     unsafe {
         cmd.pre_exec(move || {
-            std::env::set_current_dir(&host_workdir)?;
             nix::unistd::chroot(&rootfs).map_err(|e| std::io::Error::other(e.to_string()))?;
-            nix::unistd::chdir("/").map_err(|e| std::io::Error::other(e.to_string()))?;
+            nix::unistd::chdir(container_workdir.as_str())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             if let Some((uid, gid)) = uid_gid {
                 nix::unistd::setgid(nix::unistd::Gid::from_raw(gid))
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -893,10 +893,8 @@ fn perform_copy(
     env_map: &HashMap<String, String>,
     build_args: &HashMap<String, String>,
 ) -> Result<Vec<PathBuf>, String> {
-    let destination = resolve_container_destination(
-        current_workdir,
-        &interpolate(&copy.destination, env_map, build_args),
-    );
+    let raw_destination = interpolate(&copy.destination, env_map, build_args);
+    let destination = resolve_container_destination(current_workdir, &raw_destination);
     let destination_host = host_path_for_container_path(rootfs, &destination)?;
 
     let (source_root, source_is_stage) = if let Some(from) = copy.from.as_deref() {
@@ -919,8 +917,9 @@ fn perform_copy(
         (context_root.to_path_buf(), false)
     };
 
-    let multiple_sources = copy.sources.len() > 1;
-    if multiple_sources {
+    let destination_is_directory =
+        copy.sources.len() > 1 || is_directory_shaped_destination(&raw_destination);
+    if destination_is_directory {
         std::fs::create_dir_all(&destination_host)
             .map_err(|e| format!("Failed to create COPY destination '{}': {}", destination, e))?;
     }
@@ -933,7 +932,8 @@ fn perform_copy(
             return Err(format!("COPY source '{}' not found", source));
         }
         for matched in matches {
-            let target = compute_copy_destination(&matched, &destination_host, multiple_sources)?;
+            let target =
+                compute_copy_destination(&matched, &destination_host, destination_is_directory)?;
             copied_paths.extend(copy_tree_or_file(&matched, &target, rootfs)?);
         }
     }
@@ -948,11 +948,11 @@ fn perform_add(
     env_map: &HashMap<String, String>,
     build_args: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let destination = resolve_container_destination(
-        current_workdir,
-        &interpolate(&copy.destination, env_map, build_args),
-    );
+    let raw_destination = interpolate(&copy.destination, env_map, build_args);
+    let destination = resolve_container_destination(current_workdir, &raw_destination);
     let destination_host = host_path_for_container_path(rootfs, &destination)?;
+    let destination_is_directory =
+        copy.sources.len() > 1 || is_directory_shaped_destination(&raw_destination);
     for source in &copy.sources {
         let resolved = interpolate(source, env_map, build_args);
         let matches = resolve_copy_matches(context_root, &resolved, false)?;
@@ -966,8 +966,11 @@ fn perform_add(
                 })?;
                 extract_archive_to_directory(&matched, &destination_host)?;
             } else {
-                let target =
-                    compute_copy_destination(&matched, &destination_host, copy.sources.len() > 1)?;
+                let target = compute_copy_destination(
+                    &matched,
+                    &destination_host,
+                    destination_is_directory,
+                )?;
                 let _ = copy_tree_or_file(&matched, &target, rootfs)?;
             }
         }
@@ -980,7 +983,12 @@ fn resolve_copy_matches(
     source: &str,
     stage_root: bool,
 ) -> Result<Vec<PathBuf>, String> {
-    let relative = normalize_relative_path(source)
+    let source_path = if stage_root {
+        source.trim_start_matches('/')
+    } else {
+        source
+    };
+    let relative = normalize_relative_path(source_path)
         .ok_or_else(|| format!("Source path '{}' escapes the build context", source))?;
     let pattern = base.join(&relative).to_string_lossy().to_string();
     if source.contains('*') || source.contains('?') || source.contains('[') {
@@ -1004,12 +1012,22 @@ fn resolve_copy_matches(
     Ok(vec![path])
 }
 
+fn is_directory_shaped_destination(destination: &str) -> bool {
+    destination == "."
+        || destination == ".."
+        || destination.ends_with('/')
+        || destination.ends_with("/.")
+        || destination.ends_with("/..")
+}
+
 fn compute_copy_destination(
     source: &Path,
     destination_host: &Path,
-    multi: bool,
+    destination_is_directory: bool,
 ) -> Result<PathBuf, String> {
-    if multi || destination_host.is_dir() || source.is_dir() {
+    if source.is_dir() {
+        Ok(destination_host.to_path_buf())
+    } else if destination_is_directory || destination_host.is_dir() {
         let name = source.file_name().ok_or_else(|| {
             format!(
                 "Unable to resolve destination name for '{}'",
@@ -1726,9 +1744,6 @@ fn ensure_symlink(path: PathBuf, target: &Path) -> Result<(), String> {
 }
 
 fn ensure_device_node_from_host(target: &Path, source: &Path) -> Result<(), String> {
-    if target.exists() {
-        return Ok(());
-    }
     let metadata = std::fs::symlink_metadata(source).map_err(|e| {
         format!(
             "Failed to read device metadata for '{}': {}",
@@ -1736,11 +1751,30 @@ fn ensure_device_node_from_host(target: &Path, source: &Path) -> Result<(), Stri
             e
         )
     })?;
+    let expected_mode = metadata.mode() as libc::mode_t;
+    let expected_dev = metadata.rdev() as libc::dev_t;
+
+    if let Ok(existing) = std::fs::symlink_metadata(target) {
+        if existing.file_type().is_char_device() && existing.rdev() == metadata.rdev() {
+            std::fs::set_permissions(
+                target,
+                std::fs::Permissions::from_mode(metadata.mode() & 0o7777),
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to normalize device node permissions '{}': {}",
+                    target.display(),
+                    e
+                )
+            })?;
+            return Ok(());
+        }
+        remove_existing_device_placeholder(target, &existing)?;
+    }
+
     let c_path = CString::new(target.as_os_str().as_encoded_bytes())
         .map_err(|_| format!("Invalid device node path '{}'", target.display()))?;
-    let mode = metadata.mode() as libc::mode_t;
-    let dev = metadata.rdev() as libc::dev_t;
-    let result = unsafe { libc::mknod(c_path.as_ptr(), mode, dev) };
+    let result = unsafe { libc::mknod(c_path.as_ptr(), expected_mode, expected_dev) };
     if result != 0 {
         return Err(format!(
             "Failed to create device node '{}': {}",
@@ -1751,9 +1785,23 @@ fn ensure_device_node_from_host(target: &Path, source: &Path) -> Result<(), Stri
     Ok(())
 }
 
+fn remove_existing_device_placeholder(
+    target: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), String> {
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(target)
+            .map_err(|e| format!("Failed to replace directory '{}': {}", target.display(), e))
+    } else {
+        std::fs::remove_file(target)
+            .map_err(|e| format!("Failed to replace file '{}': {}", target.display(), e))
+    }
+}
+
 struct BuildMountGuard {
     proc_path: PathBuf,
     proc_mounted: bool,
+    device_mounts: Vec<PathBuf>,
 }
 
 struct BuildAptGuard {
@@ -1832,19 +1880,52 @@ impl BuildMountGuard {
                 ));
             }
         };
+        let device_mounts = bind_standard_devices(rootfs)?;
         Ok(Self {
             proc_path,
             proc_mounted,
+            device_mounts,
         })
     }
 }
 
 impl Drop for BuildMountGuard {
     fn drop(&mut self) {
+        for path in self.device_mounts.iter().rev() {
+            let _ = umount2(path, MntFlags::MNT_DETACH);
+        }
         if self.proc_mounted {
             let _ = umount2(&self.proc_path, MntFlags::MNT_DETACH);
         }
     }
+}
+
+fn bind_standard_devices(rootfs: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut mounted = Vec::new();
+    for name in ["null", "zero", "random", "urandom", "tty"] {
+        let target = rootfs.join("dev").join(name);
+        let source = Path::new("/dev").join(name);
+        mount(
+            Some(source.as_path()),
+            target.as_path(),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            for mounted_path in mounted.iter().rev() {
+                let _ = umount2(mounted_path, MntFlags::MNT_DETACH);
+            }
+            format!(
+                "Failed to bind trusted build device '{}' to '{}': {}",
+                source.display(),
+                target.display(),
+                e
+            )
+        })?;
+        mounted.push(target);
+    }
+    Ok(mounted)
 }
 
 struct BuildWorkspaceGuard {
@@ -1956,5 +2037,48 @@ mod tests {
         assert_eq!(busybox.ino(), sh.ino());
         assert_eq!(busybox.nlink(), 2);
         assert_eq!(sh.nlink(), 2);
+    }
+
+    #[test]
+    fn copy_destination_for_directory_uses_destination_as_content_root() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("src");
+        let destination = dir.path().join("app/src");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let target = compute_copy_destination(&source, &destination, true).unwrap();
+
+        assert_eq!(target, destination);
+    }
+
+    #[test]
+    fn copy_destination_for_file_appends_name_for_directory_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("Cargo.toml");
+        let destination = dir.path().join("app");
+        std::fs::write(&source, b"[package]").unwrap();
+
+        let target = compute_copy_destination(&source, &destination, true).unwrap();
+
+        assert_eq!(target, destination.join("Cargo.toml"));
+    }
+
+    #[test]
+    fn directory_shaped_copy_destinations_match_docker_surface() {
+        assert!(is_directory_shaped_destination("./"));
+        assert!(is_directory_shaped_destination("/app/."));
+        assert!(!is_directory_shaped_destination("/app/file"));
+    }
+
+    #[test]
+    fn copy_from_stage_accepts_absolute_container_sources() {
+        let dir = tempdir().unwrap();
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("app/target/release")).unwrap();
+        std::fs::write(rootfs.join("app/target/release/linx"), b"binary").unwrap();
+
+        let matches = resolve_copy_matches(&rootfs, "/app/target/release/linx", true).unwrap();
+
+        assert_eq!(matches, vec![rootfs.join("app/target/release/linx")]);
     }
 }
