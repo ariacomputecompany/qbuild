@@ -175,11 +175,15 @@ impl BuildService {
             let image = self.ensure_image_available(&stage.base_image).await?;
             let image_manager = ImageManager::new(&self.image_store_path)
                 .map_err(|e| format!("Failed to initialize image manager: {}", e))?;
+            let build_rootfs_id = format!("build-{}-{}", idx, uuid::Uuid::new_v4());
             let prepared = image_manager
-                .prepare_rootfs(&image, &format!("build-{}-{}", idx, uuid::Uuid::new_v4()))
+                .prepare_rootfs(&image, &build_rootfs_id)
                 .await
                 .map_err(|e| format!("Failed to prepare base image rootfs: {}", e))?;
-            copy_tree(&prepared, &rootfs)?;
+            let copy_result = copy_tree(&prepared, &rootfs);
+            let cleanup_result = image_manager.remove_rootfs(&build_rootfs_id);
+            copy_result?;
+            cleanup_result.map_err(|e| format!("Failed to cleanup build rootfs: {}", e))?;
             config_arch = image.config.architecture.clone();
             config_os = image.config.os.clone();
             if let Some(existing) = image.config.config.clone() {
@@ -262,8 +266,7 @@ impl BuildService {
                     layer_entries.push(built_layer);
                 }
                 Instruction::Copy(copy) => {
-                    let before = snapshot_rootfs(&rootfs, &stage_root, "before-copy")?;
-                    perform_copy(
+                    let copied_paths = perform_copy(
                         copy,
                         context.context_root,
                         &rootfs,
@@ -272,8 +275,12 @@ impl BuildService {
                         &env_map,
                         &build_args,
                     )?;
-                    let built_layer =
-                        build_layer_from_diff(&self.image_store_path, &before, &rootfs, "COPY")?;
+                    let built_layer = build_layer_from_paths(
+                        &self.image_store_path,
+                        &rootfs,
+                        &copied_paths,
+                        "COPY",
+                    )?;
                     diff_ids.push(built_layer.diff_id.clone());
                     history.push(history_entry("COPY", "COPY", false));
                     layer_entries.push(built_layer);
@@ -885,7 +892,7 @@ fn perform_copy(
     current_workdir: &str,
     env_map: &HashMap<String, String>,
     build_args: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<Vec<PathBuf>, String> {
     let destination = resolve_container_destination(
         current_workdir,
         &interpolate(&copy.destination, env_map, build_args),
@@ -918,6 +925,7 @@ fn perform_copy(
             .map_err(|e| format!("Failed to create COPY destination '{}': {}", destination, e))?;
     }
 
+    let mut copied_paths = Vec::new();
     for source in &copy.sources {
         let resolved = interpolate(source, env_map, build_args);
         let matches = resolve_copy_matches(&source_root, &resolved, source_is_stage)?;
@@ -926,10 +934,10 @@ fn perform_copy(
         }
         for matched in matches {
             let target = compute_copy_destination(&matched, &destination_host, multiple_sources)?;
-            copy_tree_or_file(&matched, &target)?;
+            copied_paths.extend(copy_tree_or_file(&matched, &target, rootfs)?);
         }
     }
-    Ok(())
+    Ok(copied_paths)
 }
 
 fn perform_add(
@@ -960,7 +968,7 @@ fn perform_add(
             } else {
                 let target =
                     compute_copy_destination(&matched, &destination_host, copy.sources.len() > 1)?;
-                copy_tree_or_file(&matched, &target)?;
+                let _ = copy_tree_or_file(&matched, &target, rootfs)?;
             }
         }
     }
@@ -1038,6 +1046,42 @@ fn build_layer_from_diff(
         })?;
     }
 
+    store_layer_blob(image_store_path, tar_data)
+}
+
+fn build_layer_from_paths(
+    image_store_path: &Path,
+    rootfs: &Path,
+    paths: &[PathBuf],
+    created_by: &str,
+) -> Result<BuiltLayer, String> {
+    let mut unique_paths = paths
+        .iter()
+        .filter(|path| !is_ephemeral_build_support_path(path))
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    unique_paths.sort();
+
+    let mut tar_data = Vec::new();
+    {
+        let mut builder = TarBuilder::new(&mut tar_data);
+        for entry in &unique_paths {
+            append_path_to_tar(&mut builder, rootfs, entry)?;
+        }
+        builder.finish().map_err(|e| {
+            format!(
+                "Failed to finalize build layer tar for '{}': {}",
+                created_by, e
+            )
+        })?;
+    }
+
+    store_layer_blob(image_store_path, tar_data)
+}
+
+fn store_layer_blob(image_store_path: &Path, tar_data: Vec<u8>) -> Result<BuiltLayer, String> {
     let uncompressed_digest = format!("sha256:{:x}", Sha256::digest(&tar_data));
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
@@ -1240,7 +1284,18 @@ fn snapshot_rootfs(rootfs: &Path, stage_root: &Path, label: &str) -> Result<Path
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut hardlinks = HashMap::new();
+    copy_tree_with_hardlinks(src, dst, &mut hardlinks).map(|_| ())
+}
+
+fn copy_tree_with_hardlinks(
+    src: &Path,
+    dst: &Path,
+    hardlinks: &mut HashMap<(u64, u64), PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut copied = Vec::new();
     for entry in walkdir::WalkDir::new(src)
+        .sort_by_file_name()
         .into_iter()
         .filter_map(Result::ok)
     {
@@ -1255,85 +1310,110 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
             continue;
         }
         let target = dst.join(relative);
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|e| format!("Failed to read metadata for '{}': {}", path.display(), e))?;
-        if metadata.is_dir() {
-            std::fs::create_dir_all(&target)
-                .map_err(|e| format!("Failed to create directory '{}': {}", target.display(), e))?;
-            std::fs::set_permissions(&target, metadata.permissions()).map_err(|e| {
-                format!("Failed to set permissions on '{}': {}", target.display(), e)
-            })?;
-        } else if metadata.file_type().is_symlink() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    format!("Failed to create directory '{}': {}", parent.display(), e)
-                })?;
-            }
-            let link_target = std::fs::read_link(path)
-                .map_err(|e| format!("Failed to read symlink '{}': {}", path.display(), e))?;
-            std::os::unix::fs::symlink(&link_target, &target)
-                .map_err(|e| format!("Failed to create symlink '{}': {}", target.display(), e))?;
-        } else {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    format!("Failed to create directory '{}': {}", parent.display(), e)
-                })?;
-            }
-            std::fs::copy(path, &target).map_err(|e| {
-                format!(
-                    "Failed to copy '{}' to '{}': {}",
-                    path.display(),
-                    target.display(),
-                    e
-                )
-            })?;
-            std::fs::set_permissions(&target, metadata.permissions()).map_err(|e| {
-                format!("Failed to set permissions on '{}': {}", target.display(), e)
-            })?;
-        }
+        copy_path_entry(path, &target, hardlinks)?;
+        copied.push(relative.to_path_buf());
     }
-    Ok(())
+    Ok(copied)
 }
 
-fn copy_tree_or_file(src: &Path, dst: &Path) -> Result<(), String> {
+fn copy_tree_or_file(src: &Path, dst: &Path, rootfs: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut copied = Vec::new();
+    let mut hardlinks = HashMap::new();
     if src.is_dir() {
         std::fs::create_dir_all(dst)
             .map_err(|e| format!("Failed to create directory '{}': {}", dst.display(), e))?;
-        copy_tree(src, dst)
-    } else if std::fs::symlink_metadata(src)
-        .map_err(|e| format!("Failed to read metadata for '{}': {}", src.display(), e))?
-        .file_type()
-        .is_symlink()
-    {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory '{}': {}", parent.display(), e))?;
+        push_layer_path(rootfs, dst, &mut copied)?;
+        for relative in copy_tree_with_hardlinks(src, dst, &mut hardlinks)? {
+            push_layer_path(rootfs, &dst.join(relative), &mut copied)?;
         }
+        Ok(copied)
+    } else {
+        copy_path_entry(src, dst, &mut hardlinks)?;
+        push_layer_path(rootfs, dst, &mut copied)?;
+        Ok(copied)
+    }
+}
+
+fn copy_path_entry(
+    src: &Path,
+    dst: &Path,
+    hardlinks: &mut HashMap<(u64, u64), PathBuf>,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(src)
+        .map_err(|e| format!("Failed to read metadata for '{}': {}", src.display(), e))?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(dst)
+            .map_err(|e| format!("Failed to create directory '{}': {}", dst.display(), e))?;
+        std::fs::set_permissions(dst, metadata.permissions())
+            .map_err(|e| format!("Failed to set permissions on '{}': {}", dst.display(), e))?;
+        return Ok(());
+    }
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory '{}': {}", parent.display(), e))?;
+    }
+
+    remove_existing_copy_target(dst)?;
+    if metadata.file_type().is_symlink() {
         let link_target = std::fs::read_link(src)
             .map_err(|e| format!("Failed to read symlink '{}': {}", src.display(), e))?;
-        let _ = std::fs::remove_file(dst);
         std::os::unix::fs::symlink(&link_target, dst)
             .map_err(|e| format!("Failed to create symlink '{}': {}", dst.display(), e))?;
-        Ok(())
-    } else {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory '{}': {}", parent.display(), e))?;
-        }
-        std::fs::copy(src, dst).map_err(|e| {
+        return Ok(());
+    }
+
+    let hardlink_key = (metadata.dev(), metadata.ino());
+    if metadata.nlink() > 1
+        && let Some(existing_target) = hardlinks.get(&hardlink_key)
+    {
+        std::fs::hard_link(existing_target, dst).map_err(|e| {
             format!(
-                "Failed to copy '{}' to '{}': {}",
-                src.display(),
+                "Failed to hard-link '{}' to '{}': {}",
+                existing_target.display(),
                 dst.display(),
                 e
             )
         })?;
-        let metadata = std::fs::symlink_metadata(src)
-            .map_err(|e| format!("Failed to read metadata for '{}': {}", src.display(), e))?;
-        std::fs::set_permissions(dst, metadata.permissions())
-            .map_err(|e| format!("Failed to set permissions on '{}': {}", dst.display(), e))?;
-        Ok(())
+        return Ok(());
     }
+
+    std::fs::copy(src, dst).map_err(|e| {
+        format!(
+            "Failed to copy '{}' to '{}': {}",
+            src.display(),
+            dst.display(),
+            e
+        )
+    })?;
+    std::fs::set_permissions(dst, metadata.permissions())
+        .map_err(|e| format!("Failed to set permissions on '{}': {}", dst.display(), e))?;
+    if metadata.nlink() > 1 {
+        hardlinks.insert(hardlink_key, dst.to_path_buf());
+    }
+    Ok(())
+}
+
+fn remove_existing_copy_target(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)
+            .map_err(|e| format!("Failed to replace directory '{}': {}", path.display(), e)),
+        Ok(_) => std::fs::remove_file(path)
+            .map_err(|e| format!("Failed to replace file '{}': {}", path.display(), e)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("Failed to inspect '{}': {}", path.display(), err)),
+    }
+}
+
+fn push_layer_path(rootfs: &Path, path: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+    let relative = path
+        .strip_prefix(rootfs)
+        .map_err(|e| format!("Failed to normalize layer path '{}': {}", path.display(), e))?
+        .to_path_buf();
+    if !relative.as_os_str().is_empty() && !is_ephemeral_build_support_path(&relative) {
+        paths.push(relative);
+    }
+    Ok(())
 }
 
 fn resolve_user(rootfs: &Path, user_spec: Option<&str>) -> Result<Option<(u32, u32)>, String> {
@@ -1857,5 +1937,24 @@ mod tests {
             entry.link_name().unwrap().unwrap(),
             Path::new("/usr/local/bin/example")
         );
+    }
+
+    #[test]
+    fn copy_tree_preserves_hardlinks() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::write(source.join("bin/busybox"), b"binary").unwrap();
+        std::fs::hard_link(source.join("bin/busybox"), source.join("bin/sh")).unwrap();
+
+        copy_tree(&source, &dest).unwrap();
+
+        let busybox = std::fs::metadata(dest.join("bin/busybox")).unwrap();
+        let sh = std::fs::metadata(dest.join("bin/sh")).unwrap();
+        assert_eq!(busybox.dev(), sh.dev());
+        assert_eq!(busybox.ino(), sh.ino());
+        assert_eq!(busybox.nlink(), 2);
+        assert_eq!(sh.nlink(), 2);
     }
 }

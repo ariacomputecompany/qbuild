@@ -10,6 +10,8 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerRecord {
@@ -56,6 +58,9 @@ pub struct CreateContainerRequest {
     pub resource_limits: Option<ResourceLimits>,
     pub clear_image_env: bool,
 }
+
+const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const STOP_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub struct ContainerStore {
     root: PathBuf,
@@ -230,12 +235,20 @@ impl ContainerStore {
         let id = self.resolve_id(id)?;
         let mut record = self.load(&id)?;
         self.refresh_state(&mut record)?;
+        if !matches!(
+            record.state,
+            ContainerState::Starting | ContainerState::Running
+        ) {
+            return Ok(record);
+        }
+
         let pid = record
             .pid
             .ok_or_else(|| format!("Container '{}' does not have a running pid", id))?;
         kill(Pid::from_raw(-(pid as i32)), signal)
             .or_else(|_| kill(Pid::from_raw(pid as i32), signal))
             .map_err(|e| format!("Failed to signal container '{}': {}", id, e))?;
+        self.wait_for_exit(&id, &mut record, STOP_WAIT_TIMEOUT)?;
         Ok(record)
     }
 
@@ -349,6 +362,31 @@ impl ContainerStore {
             self.write_record(record)?;
         }
         Ok(())
+    }
+
+    fn wait_for_exit(
+        &self,
+        id: &str,
+        record: &mut ContainerRecord,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.refresh_state(record)?;
+            if !matches!(
+                record.state,
+                ContainerState::Starting | ContainerState::Running
+            ) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Timed out waiting for container '{}' to stop after {:?}",
+                    id, timeout
+                ));
+            }
+            sleep(STOP_WAIT_POLL_INTERVAL);
+        }
     }
 
     fn data_root(&self) -> &Path {
