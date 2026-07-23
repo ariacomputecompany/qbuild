@@ -117,12 +117,19 @@ sudo qbuild run local.test/my-app:latest
 Create and manage a persistent local container:
 
 ```bash
-CID=$(qbuild create local.test/my-app:latest)
+CID=$(qbuild create local.test/my-app:latest --name my-app)
 sudo qbuild start "$CID"
 qbuild ps
 qbuild logs "$CID"
 sudo qbuild stop "$CID"
 qbuild rm "$CID"
+```
+
+Bind host state into a container:
+
+```bash
+qbuild create local.test/my-app:latest --name my-app -v /host/workspace:/workspace:rw
+qbuild create local.test/my-app:latest --name my-app -v /host/cache:/cache:ro
 ```
 
 Build with explicit paths:

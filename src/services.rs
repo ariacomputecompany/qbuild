@@ -7,9 +7,10 @@ use crate::containers::{ContainerStore, CreateContainerRequest};
 use crate::error::AppError;
 use crate::image::{ImageReference, ImageStore, OciManifest};
 use crate::protocol::{
-    BuildOutput, CommandRequest, ContainerSummaryOutput, CreateOutput, GuestEvent, GuestResponse,
-    ImageReferenceOutput, InspectOutput, ListOutput, LogsOutput, NamespaceConfig, PsOutput,
-    PullOutput, PushOutput, RemoveOutput, ResourceLimits, RunOutput, StartOutput, StopOutput,
+    BindMountSpec, BuildOutput, CommandRequest, ContainerSummaryOutput, CreateOutput, GuestEvent,
+    GuestResponse, ImageReferenceOutput, InspectOutput, ListOutput, LogsOutput, NamespaceConfig,
+    PsOutput, PullOutput, PushOutput, RemoveOutput, ResourceLimits, RunOutput, StartOutput,
+    StopOutput,
 };
 use crate::registry::{PullEvent, PullOptions, PushEvent, RegistryClient};
 use crate::runtime::{RunRequest, RunService};
@@ -146,6 +147,7 @@ async fn push(
 async fn run(cmd: RunCommand) -> Result<RunOutput, AppError> {
     let store_dir = cmd.store_dir.unwrap_or_else(crate::default_store_dir);
     let service = RunService::new();
+    let container_id = parse_container_name(cmd.name.as_deref())?.map(ToString::to_string);
     let result = service
         .run(RunRequest {
             image_reference: cmd.reference,
@@ -159,9 +161,10 @@ async fn run(cmd: RunCommand) -> Result<RunOutput, AppError> {
                 ipc: cmd.ipc_namespace,
                 network: cmd.network_namespace,
             },
+            mounts: parse_mounts(&cmd.mounts)?,
             resource_limits: build_limits(cmd.memory_mb, cmd.cpu_percent, cmd.pids_limit),
             clear_image_env: cmd.clear_image_env,
-            container_id: None,
+            container_id,
             status_file: None,
             started_at: None,
         })
@@ -179,6 +182,7 @@ fn create(cmd: CreateCommand) -> Result<CreateOutput, AppError> {
     let record = store
         .create(CreateContainerRequest {
             image_reference: cmd.reference,
+            name: cmd.name,
             command: cmd.command,
             environment: parse_key_values(&cmd.env, "env override")?,
             working_directory: cmd.workdir,
@@ -188,6 +192,7 @@ fn create(cmd: CreateCommand) -> Result<CreateOutput, AppError> {
                 ipc: cmd.ipc_namespace,
                 network: cmd.network_namespace,
             },
+            mounts: parse_mounts(&cmd.mounts)?,
             resource_limits: build_limits(cmd.memory_mb, cmd.cpu_percent, cmd.pids_limit),
             clear_image_env: cmd.clear_image_env,
         })
@@ -235,6 +240,7 @@ fn ps(cmd: PsCommand) -> Result<PsOutput, AppError> {
             .map(|container| ContainerSummaryOutput {
                 id: container.id,
                 image_reference: container.image_reference,
+                name: container.name,
                 state: container.state,
                 pid: container.pid,
                 exit_code: container.exit_code,
@@ -318,6 +324,71 @@ fn parse_key_values(values: &[String], kind: &str) -> Result<HashMap<String, Str
         items.insert(key.to_string(), value.to_string());
     }
     Ok(items)
+}
+
+fn parse_mounts(values: &[String]) -> Result<Vec<BindMountSpec>, AppError> {
+    values
+        .iter()
+        .map(|value| {
+            let parts = value.split(':').collect::<Vec<_>>();
+            if parts.len() < 2 || parts.len() > 3 {
+                return Err(AppError::Message(format!(
+                    "Invalid mount '{}', expected SOURCE:TARGET[:ro|rw]",
+                    value
+                )));
+            }
+            let source = parts[0].trim();
+            let target = parts[1].trim();
+            if source.is_empty() || target.is_empty() {
+                return Err(AppError::Message(format!(
+                    "Invalid mount '{}', source and target are required",
+                    value
+                )));
+            }
+            let readonly = match parts.get(2).map(|mode| mode.trim()) {
+                None | Some("") | Some("rw") => false,
+                Some("ro") => true,
+                Some(mode) => {
+                    return Err(AppError::Message(format!(
+                        "Invalid mount mode '{}' in '{}', expected ro or rw",
+                        mode, value
+                    )));
+                }
+            };
+            Ok(BindMountSpec {
+                source: source.to_string(),
+                target: target.to_string(),
+                readonly,
+            })
+        })
+        .collect()
+}
+
+fn parse_container_name(name: Option<&str>) -> Result<Option<&str>, AppError> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    if name.is_empty() {
+        return Err(AppError::Message(
+            "Container name cannot be empty".to_string(),
+        ));
+    }
+    if name.len() > 128 {
+        return Err(AppError::Message(format!(
+            "Container name '{}' is too long",
+            name
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(AppError::Message(format!(
+            "Container name '{}' may only contain ASCII letters, numbers, '.', '_' and '-'",
+            name
+        )));
+    }
+    Ok(Some(name))
 }
 
 fn build_limits(
@@ -408,5 +479,48 @@ fn format_push_event(event: PushEvent) -> String {
         PushEvent::Complete { reference, digest } => {
             format!("push complete {} ({})", reference, digest)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mounts_accepts_read_write_and_readonly_specs() {
+        let mounts = parse_mounts(&[
+            "/host/work:/workspace".to_string(),
+            "/host/cache:/cache:ro".to_string(),
+        ])
+        .expect("mount specs should parse");
+
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].source, "/host/work");
+        assert_eq!(mounts[0].target, "/workspace");
+        assert!(!mounts[0].readonly);
+        assert_eq!(mounts[1].source, "/host/cache");
+        assert_eq!(mounts[1].target, "/cache");
+        assert!(mounts[1].readonly);
+    }
+
+    #[test]
+    fn parse_mounts_rejects_unknown_modes() {
+        let err = parse_mounts(&["/host:/container:shared".to_string()])
+            .expect_err("unknown mount mode should fail");
+        assert!(err.to_string().contains("expected ro or rw"));
+    }
+
+    #[test]
+    fn parse_container_name_accepts_stable_ascii_names() {
+        assert_eq!(
+            parse_container_name(Some("aria-afw_gpu.1")).unwrap(),
+            Some("aria-afw_gpu.1")
+        );
+    }
+
+    #[test]
+    fn parse_container_name_rejects_path_like_names() {
+        let err = parse_container_name(Some("../aria")).expect_err("path-like name should fail");
+        assert!(err.to_string().contains("may only contain ASCII"));
     }
 }

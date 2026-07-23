@@ -1,12 +1,13 @@
 use crate::image::{ImageManager, ImageReference, OciImage};
-use crate::protocol::{NamespaceConfig, ResourceLimits};
+use crate::protocol::{BindMountSpec, NamespaceConfig, ResourceLimits};
 use nix::mount::{MsFlags, mount};
 use nix::sched::CloneFlags;
 use nix::unistd::{Gid, Pid, Uid, chdir, chroot, setpgid};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -19,6 +20,7 @@ pub struct RunRequest {
     pub namespace_config: NamespaceConfig,
     pub resource_limits: Option<ResourceLimits>,
     pub clear_image_env: bool,
+    pub mounts: Vec<BindMountSpec>,
     pub container_id: Option<String>,
     pub status_file: Option<PathBuf>,
     pub started_at: Option<i64>,
@@ -113,6 +115,13 @@ impl RunService {
         let user = image.user();
         let namespace_flags = build_clone_flags(&request.namespace_config);
         let mount_namespace = request.namespace_config.mount;
+        if !request.mounts.is_empty() && !mount_namespace {
+            return Err(
+                "Bind mounts require qbuild's mount namespace; remove --no-mount-namespace"
+                    .to_string(),
+            );
+        }
+        let mounts = request.mounts.clone();
 
         let rootfs = rootfs.to_path_buf();
         let workdir_clone = workdir.clone();
@@ -138,6 +147,7 @@ impl RunService {
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                 prepare_runtime_rootfs(&rootfs).map_err(std::io::Error::other)?;
+                apply_bind_mounts(&rootfs, &mounts).map_err(std::io::Error::other)?;
                 chroot(&rootfs).map_err(|e| std::io::Error::other(e.to_string()))?;
                 chdir("/").map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -323,6 +333,95 @@ fn mount_proc_inside_rootfs() -> Result<(), String> {
     .map_err(|e| format!("Failed to mount /proc in runtime: {}", e))
 }
 
+fn apply_bind_mounts(rootfs: &Path, mounts: &[BindMountSpec]) -> Result<(), String> {
+    for spec in mounts {
+        let source = std::fs::canonicalize(&spec.source).map_err(|e| {
+            format!(
+                "Failed to resolve bind mount source '{}': {}",
+                spec.source, e
+            )
+        })?;
+        let metadata = std::fs::metadata(&source).map_err(|e| {
+            format!(
+                "Failed to read bind mount source '{}': {}",
+                source.display(),
+                e
+            )
+        })?;
+        let target = normalize_container_mount_target(&spec.target)?;
+        let host_target = rootfs.join(
+            target
+                .strip_prefix("/")
+                .map_err(|_| format!("Bind mount target '{}' must be absolute", spec.target))?,
+        );
+
+        if metadata.is_dir() {
+            std::fs::create_dir_all(&host_target).map_err(|e| {
+                format!(
+                    "Failed to create bind mount target '{}': {}",
+                    host_target.display(),
+                    e
+                )
+            })?;
+        } else if metadata.is_file() {
+            if let Some(parent) = host_target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed to create bind mount target parent '{}': {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+            }
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&host_target)
+                .map_err(|e| {
+                    format!(
+                        "Failed to create bind mount target '{}': {}",
+                        host_target.display(),
+                        e
+                    )
+                })?;
+        } else {
+            return Err(format!(
+                "Bind mount source '{}' must be a regular file or directory",
+                source.display()
+            ));
+        }
+
+        mount(
+            Some(source.as_path()),
+            host_target.as_path(),
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to bind mount '{}' to '{}': {}",
+                source.display(),
+                target.display(),
+                e
+            )
+        })?;
+
+        if spec.readonly {
+            mount(
+                Some(source.as_path()),
+                host_target.as_path(),
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+                None::<&str>,
+            )
+            .map_err(|e| format!("Failed to remount '{}' readonly: {}", target.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_symlink(path: PathBuf, target: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => return Ok(()),
@@ -424,6 +523,36 @@ fn parse_uid_gid(user_spec: &str) -> Option<(u32, u32)> {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(uid);
     Some((uid, gid))
+}
+
+fn normalize_container_mount_target(target: &str) -> Result<PathBuf, String> {
+    let raw = Path::new(target);
+    if !raw.is_absolute() {
+        return Err(format!("Bind mount target '{}' must be absolute", target));
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in raw.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                return Err(format!(
+                    "Bind mount target '{}' cannot contain parent traversal",
+                    target
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(format!(
+                    "Bind mount target '{}' is not a Linux path",
+                    target
+                ));
+            }
+        }
+    }
+    if normalized == Path::new("/") {
+        return Err("Bind mount target cannot be '/'".to_string());
+    }
+    Ok(normalized)
 }
 
 struct CgroupManager {

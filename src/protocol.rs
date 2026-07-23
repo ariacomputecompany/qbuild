@@ -34,6 +34,13 @@ pub struct ResourceLimits {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BindMountSpec {
+    pub source: String,
+    pub target: String,
+    pub readonly: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerState {
     Created,
@@ -172,6 +179,7 @@ pub struct PsOutput {
 pub struct ContainerSummaryOutput {
     pub id: String,
     pub image_reference: String,
+    pub name: Option<String>,
     pub state: ContainerState,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,

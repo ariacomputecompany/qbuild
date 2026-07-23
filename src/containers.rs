@@ -1,4 +1,4 @@
-use crate::protocol::{ContainerState, NamespaceConfig, ResourceLimits};
+use crate::protocol::{BindMountSpec, ContainerState, NamespaceConfig, ResourceLimits};
 use crate::runtime::{RunRequest, RunResult, RunService};
 use chrono::Utc;
 use nix::sys::signal::{Signal, kill};
@@ -15,10 +15,12 @@ use std::process::Stdio;
 pub struct ContainerRecord {
     pub id: String,
     pub image_reference: String,
+    pub name: Option<String>,
     pub command: Vec<String>,
     pub environment: HashMap<String, String>,
     pub working_directory: Option<String>,
     pub namespace_config: NamespaceConfig,
+    pub mounts: Vec<BindMountSpec>,
     pub resource_limits: Option<ResourceLimits>,
     pub clear_image_env: bool,
     pub state: ContainerState,
@@ -33,6 +35,7 @@ pub struct ContainerRecord {
 pub struct ContainerSummary {
     pub id: String,
     pub image_reference: String,
+    pub name: Option<String>,
     pub state: ContainerState,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
@@ -44,10 +47,12 @@ pub struct ContainerSummary {
 #[derive(Debug, Clone)]
 pub struct CreateContainerRequest {
     pub image_reference: String,
+    pub name: Option<String>,
     pub command: Vec<String>,
     pub environment: HashMap<String, String>,
     pub working_directory: Option<String>,
     pub namespace_config: NamespaceConfig,
+    pub mounts: Vec<BindMountSpec>,
     pub resource_limits: Option<ResourceLimits>,
     pub clear_image_env: bool,
 }
@@ -74,14 +79,22 @@ impl ContainerStore {
     }
 
     pub fn create(&self, request: CreateContainerRequest) -> Result<ContainerRecord, String> {
+        if let Some(name) = request.name.as_deref() {
+            validate_container_name(name)?;
+            if self.find_id_by_name(name)?.is_some() {
+                return Err(format!("Container name '{}' is already in use", name));
+            }
+        }
         let id = format!("ctr-{}", uuid::Uuid::new_v4().simple());
         let record = ContainerRecord {
             id: id.clone(),
             image_reference: request.image_reference,
+            name: request.name,
             command: request.command,
             environment: request.environment,
             working_directory: request.working_directory,
             namespace_config: request.namespace_config,
+            mounts: request.mounts,
             resource_limits: request.resource_limits,
             clear_image_env: request.clear_image_env,
             state: ContainerState::Created,
@@ -139,6 +152,7 @@ impl ContainerStore {
             items.push(ContainerSummary {
                 id: record.id,
                 image_reference: record.image_reference,
+                name: record.name,
                 state: record.state,
                 pid: record.pid,
                 exit_code: record.exit_code,
@@ -152,7 +166,8 @@ impl ContainerStore {
     }
 
     pub fn start(&self, id: &str) -> Result<ContainerRecord, String> {
-        let mut record = self.load(id)?;
+        let id = self.resolve_id(id)?;
+        let mut record = self.load(&id)?;
         self.refresh_state(&mut record)?;
         if matches!(
             record.state,
@@ -161,7 +176,7 @@ impl ContainerStore {
             return Err(format!("Container '{}' is already {:?}", id, record.state));
         }
 
-        let dir = self.container_dir(id);
+        let dir = self.container_dir(&id);
         let stdout_path = dir.join("stdout.log");
         let stderr_path = dir.join("stderr.log");
         let stdout = File::options()
@@ -190,7 +205,7 @@ impl ContainerStore {
             .arg("--store-dir")
             .arg(&self.store_dir)
             .arg("--container-id")
-            .arg(id)
+            .arg(&id)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -212,7 +227,8 @@ impl ContainerStore {
     }
 
     pub fn stop(&self, id: &str, signal: Signal) -> Result<ContainerRecord, String> {
-        let mut record = self.load(id)?;
+        let id = self.resolve_id(id)?;
+        let mut record = self.load(&id)?;
         self.refresh_state(&mut record)?;
         let pid = record
             .pid
@@ -224,7 +240,8 @@ impl ContainerStore {
     }
 
     pub fn remove(&self, id: &str) -> Result<(), String> {
-        let mut record = self.load(id)?;
+        let id = self.resolve_id(id)?;
+        let mut record = self.load(&id)?;
         self.refresh_state(&mut record)?;
         if matches!(
             record.state,
@@ -232,20 +249,21 @@ impl ContainerStore {
         ) {
             return Err(format!("Container '{}' is still {:?}", id, record.state));
         }
-        std::fs::remove_dir_all(self.container_dir(id)).map_err(|e| {
+        std::fs::remove_dir_all(self.container_dir(&id)).map_err(|e| {
             format!(
                 "Failed to remove container dir '{}': {}",
-                self.container_dir(id).display(),
+                self.container_dir(&id).display(),
                 e
             )
         })
     }
 
     pub fn logs(&self, id: &str, stderr: bool) -> Result<String, String> {
+        let id = self.resolve_id(id)?;
         let path = if stderr {
-            self.container_dir(id).join("stderr.log")
+            self.container_dir(&id).join("stderr.log")
         } else {
-            self.container_dir(id).join("stdout.log")
+            self.container_dir(&id).join("stdout.log")
         };
         let mut file = File::open(&path)
             .map_err(|e| format!("Failed to open log file '{}': {}", path.display(), e))?;
@@ -273,6 +291,7 @@ impl ContainerStore {
                 store_dir: self.store_dir.clone(),
                 namespace_config: record.namespace_config.clone(),
                 resource_limits: record.resource_limits.clone(),
+                mounts: record.mounts.clone(),
                 clear_image_env: record.clear_image_env,
                 container_id: Some(record.id.clone()),
                 status_file: Some(self.status_path(&record.id)),
@@ -364,6 +383,39 @@ impl ContainerStore {
         })
     }
 
+    fn resolve_id(&self, id_or_name: &str) -> Result<String, String> {
+        if self.record_path(id_or_name).exists() {
+            return Ok(id_or_name.to_string());
+        }
+        self.find_id_by_name(id_or_name)?
+            .ok_or_else(|| format!("Container '{}' was not found by id or name", id_or_name))
+    }
+
+    fn find_id_by_name(&self, name: &str) -> Result<Option<String>, String> {
+        for entry in std::fs::read_dir(&self.root).map_err(|e| {
+            format!(
+                "Failed to list container store '{}': {}",
+                self.root.display(),
+                e
+            )
+        })? {
+            let entry = entry.map_err(|e| format!("Failed to read container dir entry: {}", e))?;
+            if !entry
+                .file_type()
+                .map_err(|e| format!("Failed to inspect container dir entry: {}", e))?
+                .is_dir()
+            {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().to_string();
+            let record = self.load(&id)?;
+            if record.name.as_deref() == Some(name) {
+                return Ok(Some(record.id));
+            }
+        }
+        Ok(None)
+    }
+
     fn container_dir(&self, id: &str) -> PathBuf {
         self.root.join(id)
     }
@@ -417,4 +469,23 @@ impl ExecStatusFile {
 
 fn process_exists(pid: u32) -> bool {
     kill(Pid::from_raw(pid as i32), None).is_ok()
+}
+
+fn validate_container_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Container name cannot be empty".to_string());
+    }
+    if name.len() > 128 {
+        return Err(format!("Container name '{}' is too long", name));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(format!(
+            "Container name '{}' may only contain ASCII letters, numbers, '.', '_' and '-'",
+            name
+        ));
+    }
+    Ok(())
 }

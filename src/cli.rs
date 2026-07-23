@@ -114,6 +114,10 @@ pub struct RunCommand {
     pub no_mount_namespace: bool,
     #[arg(long)]
     pub uts_namespace: bool,
+    #[arg(short = 'v', long = "volume", alias = "mount")]
+    pub mounts: Vec<String>,
+    #[arg(long)]
+    pub name: Option<String>,
     #[arg(long)]
     pub ipc_namespace: bool,
     #[arg(long)]
@@ -145,6 +149,10 @@ pub struct CreateCommand {
     pub no_mount_namespace: bool,
     #[arg(long)]
     pub uts_namespace: bool,
+    #[arg(short = 'v', long = "volume", alias = "mount")]
+    pub mounts: Vec<String>,
+    #[arg(long)]
+    pub name: Option<String>,
     #[arg(long)]
     pub ipc_namespace: bool,
     #[arg(long)]

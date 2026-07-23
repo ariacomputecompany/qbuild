@@ -68,8 +68,9 @@ pub fn render_response(request: &CommandRequest, response: GuestResponse) -> Res
             } else {
                 for container in result.containers {
                     println!(
-                        "{}\t{}\t{:?}\t{}",
+                        "{}\t{}\t{}\t{:?}\t{}",
                         container.id,
+                        container.name.as_deref().unwrap_or(""),
                         container.image_reference,
                         container.state,
                         container.pid.map(|pid| pid.to_string()).unwrap_or_default()
