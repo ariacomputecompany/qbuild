@@ -216,6 +216,9 @@ fn prepare_amd_runtime(devices: &[LocalGpuDevice]) -> Result<GpuRuntimeSpec, Str
             push_mount(&mut mounts, &device.device_path, false);
         }
     }
+    for path in trusted_existing_paths(["/sys"]) {
+        push_mount(&mut mounts, &path, true);
+    }
     for path in trusted_existing_paths(["/usr/lib/wsl/lib"]) {
         push_mount(&mut mounts, &path, true);
     }
