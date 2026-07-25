@@ -1736,6 +1736,7 @@ fn install_build_resolver(rootfs: &Path) -> Result<(), String> {
 
     let resolver = build_resolver_contents()
         .ok_or_else(|| "Failed to find a usable host resolver for build rootfs".to_string())?;
+    remove_resolver_placeholder(&target)?;
     std::fs::write(&target, resolver).map_err(|e| {
         format!(
             "Failed to write build resolver '{}': {}",
@@ -1760,6 +1761,28 @@ fn build_resolver_contents() -> Option<String> {
     }
 
     Some("nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:3\n".to_string())
+}
+
+fn remove_resolver_placeholder(target: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(target),
+        Ok(_) => std::fs::remove_file(target),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect build resolver '{}': {}",
+                target.display(),
+                err
+            ));
+        }
+    }
+    .map_err(|e| {
+        format!(
+            "Failed to replace build resolver '{}': {}",
+            target.display(),
+            e
+        )
+    })
 }
 
 fn has_nameserver(contents: &str) -> bool {
