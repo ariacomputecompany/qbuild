@@ -6,7 +6,7 @@ use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -403,7 +403,7 @@ impl ContainerStore {
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|e| format!("Failed to encode container record '{}': {}", record.id, e))?;
         let path = self.record_path(&record.id);
-        std::fs::write(&path, bytes).map_err(|e| {
+        write_file_atomically(&path, &bytes).map_err(|e| {
             format!(
                 "Failed to write container record '{}': {}",
                 path.display(),
@@ -416,7 +416,7 @@ impl ContainerStore {
         let bytes = serde_json::to_vec_pretty(status)
             .map_err(|e| format!("Failed to encode container status '{}': {}", status.id, e))?;
         let path = self.status_path(&status.id);
-        std::fs::write(&path, bytes).map_err(|e| {
+        write_file_atomically(&path, &bytes).map_err(|e| {
             format!(
                 "Failed to write container status '{}': {}",
                 path.display(),
@@ -469,6 +469,40 @@ impl ContainerStore {
     fn status_path(&self, id: &str) -> PathBuf {
         self.container_dir(id).join("status.json")
     }
+}
+
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path '{}' has no parent", path.display()),
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path '{}' has no file name", path.display()),
+        )
+    })?;
+    let tmp_name = format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    let write_result = (|| {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
