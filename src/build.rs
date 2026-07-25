@@ -1705,6 +1705,7 @@ fn prepare_build_rootfs(rootfs: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to create build rootfs /dev: {}", e))?;
     std::fs::create_dir_all(rootfs.join("proc"))
         .map_err(|e| format!("Failed to create build rootfs /proc: {}", e))?;
+    install_build_resolver(rootfs)?;
 
     for name in ["null", "zero", "random", "urandom", "tty"] {
         ensure_device_node_from_host(
@@ -1717,6 +1718,61 @@ fn prepare_build_rootfs(rootfs: &Path) -> Result<(), String> {
     ensure_symlink(rootfs.join("dev/stdout"), Path::new("/proc/self/fd/1"))?;
     ensure_symlink(rootfs.join("dev/stderr"), Path::new("/proc/self/fd/2"))?;
     Ok(())
+}
+
+fn install_build_resolver(rootfs: &Path) -> Result<(), String> {
+    let etc_dir = rootfs.join("etc");
+    std::fs::create_dir_all(&etc_dir)
+        .map_err(|e| format!("Failed to create build rootfs /etc: {}", e))?;
+
+    let target = etc_dir.join("resolv.conf");
+    let target_contents = std::fs::read_to_string(&target).ok();
+    if target_contents
+        .as_deref()
+        .is_some_and(|contents| !uses_loopback_nameserver(contents))
+    {
+        return Ok(());
+    }
+
+    let resolver = build_resolver_contents()
+        .ok_or_else(|| "Failed to find a usable host resolver for build rootfs".to_string())?;
+    std::fs::write(&target, resolver).map_err(|e| {
+        format!(
+            "Failed to write build resolver '{}': {}",
+            target.display(),
+            e
+        )
+    })
+}
+
+fn build_resolver_contents() -> Option<String> {
+    for path in [
+        "/run/systemd/resolve/resolv.conf",
+        "/run/resolvconf/resolv.conf",
+        "/etc/resolv.conf",
+    ] {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !uses_loopback_nameserver(&contents) && has_nameserver(&contents) {
+            return Some(contents);
+        }
+    }
+
+    Some("nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:3\n".to_string())
+}
+
+fn has_nameserver(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| line.trim_start().starts_with("nameserver "))
+}
+
+fn uses_loopback_nameserver(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("nameserver 127.") || trimmed.starts_with("nameserver ::1")
+    })
 }
 
 fn ensure_symlink(path: PathBuf, target: &Path) -> Result<(), String> {
