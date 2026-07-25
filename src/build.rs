@@ -5,7 +5,7 @@ use crate::image::{
 use crate::registry::{PullOptions, RegistryClient};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use glob::glob;
+use glob::{Pattern, glob};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -45,6 +45,7 @@ struct BuildExecutionContext<'a> {
     prior_outputs: &'a [StageOutput],
     request: &'a BuildRequest,
     context_root: &'a Path,
+    context_ignore: &'a DockerIgnore,
     work_root: &'a Path,
 }
 
@@ -82,6 +83,7 @@ impl BuildService {
                 e
             )
         })?;
+        let context_ignore = DockerIgnore::load(&req.context_dir)?;
         let instructions = parse_dockerfile(&dockerfile_text)?;
         verify_build_execution_requirements(&instructions)?;
         let stages = group_stages(&instructions)?;
@@ -99,6 +101,7 @@ impl BuildService {
                 prior_outputs: &stage_outputs,
                 request: &req,
                 context_root: &req.context_dir,
+                context_ignore: &context_ignore,
                 work_root: &work_root,
             };
             let output = self.build_stage(idx, stage, &context).await?;
@@ -270,6 +273,7 @@ impl BuildService {
                     let copied_paths = perform_copy(
                         copy,
                         context.context_root,
+                        context.context_ignore,
                         &rootfs,
                         context.prior_outputs,
                         &current_workdir,
@@ -291,6 +295,7 @@ impl BuildService {
                     perform_add(
                         copy,
                         context.context_root,
+                        context.context_ignore,
                         &rootfs,
                         &current_workdir,
                         &env_map,
@@ -901,6 +906,7 @@ fn execute_run(
 fn perform_copy(
     copy: &CopyInstruction,
     context_root: &Path,
+    context_ignore: &DockerIgnore,
     rootfs: &Path,
     prior_outputs: &[StageOutput],
     current_workdir: &str,
@@ -930,6 +936,7 @@ fn perform_copy(
     } else {
         (context_root.to_path_buf(), false)
     };
+    let active_ignore = (!source_is_stage).then_some(context_ignore);
 
     let destination_is_directory =
         copy.sources.len() > 1 || is_directory_shaped_destination(&raw_destination);
@@ -946,9 +953,18 @@ fn perform_copy(
             return Err(format!("COPY source '{}' not found", source));
         }
         for matched in matches {
+            if is_context_ignored(&matched, context_root, active_ignore)? {
+                continue;
+            }
             let target =
                 compute_copy_destination(&matched, &destination_host, destination_is_directory)?;
-            copied_paths.extend(copy_tree_or_file(&matched, &target, rootfs)?);
+            copied_paths.extend(copy_tree_or_file_with_ignore(
+                &matched,
+                &target,
+                rootfs,
+                active_ignore,
+                context_root,
+            )?);
         }
     }
     Ok(copied_paths)
@@ -957,6 +973,7 @@ fn perform_copy(
 fn perform_add(
     copy: &CopyInstruction,
     context_root: &Path,
+    context_ignore: &DockerIgnore,
     rootfs: &Path,
     current_workdir: &str,
     env_map: &HashMap<String, String>,
@@ -974,6 +991,9 @@ fn perform_add(
             return Err(format!("ADD source '{}' not found", source));
         }
         for matched in matches {
+            if is_context_ignored(&matched, context_root, Some(context_ignore))? {
+                continue;
+            }
             if is_archive_path(&matched) {
                 std::fs::create_dir_all(&destination_host).map_err(|e| {
                     format!("Failed to create ADD destination '{}': {}", destination, e)
@@ -985,7 +1005,13 @@ fn perform_add(
                     &destination_host,
                     destination_is_directory,
                 )?;
-                let _ = copy_tree_or_file(&matched, &target, rootfs)?;
+                let _ = copy_tree_or_file_with_ignore(
+                    &matched,
+                    &target,
+                    rootfs,
+                    Some(context_ignore),
+                    context_root,
+                )?;
             }
         }
     }
@@ -1317,18 +1343,29 @@ fn snapshot_rootfs(rootfs: &Path, stage_root: &Path, label: &str) -> Result<Path
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     let mut hardlinks = HashMap::new();
-    copy_tree_with_hardlinks(src, dst, &mut hardlinks).map(|_| ())
+    copy_tree_with_hardlinks(src, dst, &mut hardlinks, None, src).map(|_| ())
 }
 
 fn copy_tree_with_hardlinks(
     src: &Path,
     dst: &Path,
     hardlinks: &mut HashMap<(u64, u64), PathBuf>,
+    context_ignore: Option<&DockerIgnore>,
+    context_root: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let mut copied = Vec::new();
     for entry in walkdir::WalkDir::new(src)
         .sort_by_file_name()
         .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == src {
+                return true;
+            }
+            match is_context_ignored(entry.path(), context_root, context_ignore) {
+                Ok(ignored) => !ignored,
+                Err(_) => false,
+            }
+        })
         .filter_map(Result::ok)
     {
         let path = entry.path();
@@ -1348,18 +1385,29 @@ fn copy_tree_with_hardlinks(
     Ok(copied)
 }
 
-fn copy_tree_or_file(src: &Path, dst: &Path, rootfs: &Path) -> Result<Vec<PathBuf>, String> {
+fn copy_tree_or_file_with_ignore(
+    src: &Path,
+    dst: &Path,
+    rootfs: &Path,
+    context_ignore: Option<&DockerIgnore>,
+    context_root: &Path,
+) -> Result<Vec<PathBuf>, String> {
     let mut copied = Vec::new();
     let mut hardlinks = HashMap::new();
     if src.is_dir() {
         std::fs::create_dir_all(dst)
             .map_err(|e| format!("Failed to create directory '{}': {}", dst.display(), e))?;
         push_layer_path(rootfs, dst, &mut copied)?;
-        for relative in copy_tree_with_hardlinks(src, dst, &mut hardlinks)? {
+        for relative in
+            copy_tree_with_hardlinks(src, dst, &mut hardlinks, context_ignore, context_root)?
+        {
             push_layer_path(rootfs, &dst.join(relative), &mut copied)?;
         }
         Ok(copied)
     } else {
+        if is_context_ignored(src, context_root, context_ignore)? {
+            return Ok(copied);
+        }
         copy_path_entry(src, dst, &mut hardlinks)?;
         push_layer_path(rootfs, dst, &mut copied)?;
         Ok(copied)
@@ -1528,6 +1576,132 @@ fn clean_container_path(path: &str) -> String {
     } else {
         result.to_string_lossy().to_string()
     }
+}
+
+#[derive(Debug, Default)]
+struct DockerIgnore {
+    rules: Vec<DockerIgnoreRule>,
+}
+
+#[derive(Debug)]
+struct DockerIgnoreRule {
+    pattern: String,
+    negated: bool,
+    directory_only: bool,
+}
+
+impl DockerIgnore {
+    fn load(context_root: &Path) -> Result<Self, String> {
+        let path = context_root.join(".dockerignore");
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
+        Ok(Self::parse(&text))
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut rules = Vec::new();
+        for raw_line in text.lines() {
+            let mut line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let negated = line.starts_with('!');
+            if negated {
+                line = line[1..].trim();
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let directory_only = line.ends_with('/');
+            let pattern = line
+                .trim_start_matches('/')
+                .trim_end_matches('/')
+                .replace('\\', "/");
+            if pattern.is_empty() {
+                continue;
+            }
+            rules.push(DockerIgnoreRule {
+                pattern,
+                negated,
+                directory_only,
+            });
+        }
+        Self { rules }
+    }
+
+    fn is_ignored(&self, relative: &Path, is_dir: bool) -> bool {
+        let relative = path_to_slash(relative);
+        if relative.is_empty() {
+            return false;
+        }
+        let mut ignored = false;
+        for rule in &self.rules {
+            if rule.matches(&relative, is_dir) {
+                ignored = !rule.negated;
+            }
+        }
+        ignored
+    }
+}
+
+impl DockerIgnoreRule {
+    fn matches(&self, relative: &str, is_dir: bool) -> bool {
+        if self.directory_only && !is_dir {
+            return false;
+        }
+        let pattern = self.pattern.as_str();
+        if pattern.contains('/') {
+            return glob_matches(pattern, relative)
+                || relative
+                    .strip_prefix(pattern)
+                    .is_some_and(|rest| rest.starts_with('/'))
+                || pattern.strip_prefix("**/").is_some_and(|suffix| {
+                    relative == suffix
+                        || relative.starts_with(&format!("{suffix}/"))
+                        || relative.ends_with(&format!("/{suffix}"))
+                        || relative.contains(&format!("/{suffix}/"))
+                });
+        }
+
+        relative.split('/').any(|component| {
+            component == pattern || Pattern::new(pattern).is_ok_and(|glob| glob.matches(component))
+        })
+    }
+}
+
+fn is_context_ignored(
+    path: &Path,
+    context_root: &Path,
+    context_ignore: Option<&DockerIgnore>,
+) -> Result<bool, String> {
+    let Some(context_ignore) = context_ignore else {
+        return Ok(false);
+    };
+    let relative = path.strip_prefix(context_root).map_err(|e| {
+        format!(
+            "Failed to normalize context path '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    Ok(context_ignore.is_ignored(relative, path.is_dir()))
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    Pattern::new(pattern).is_ok_and(|glob| glob.matches(value))
+}
+
+fn path_to_slash(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn normalize_relative_path(path: &str) -> Option<PathBuf> {
@@ -2130,6 +2304,44 @@ mod tests {
         assert_eq!(busybox.ino(), sh.ino());
         assert_eq!(busybox.nlink(), 2);
         assert_eq!(sh.nlink(), 2);
+    }
+
+    #[test]
+    fn dockerignore_matches_ordered_rules_and_exceptions() {
+        let ignore = DockerIgnore::parse(
+            r#"
+            .git
+            benchmarks
+            **/.venv
+            *.log
+            !docker/inference/wheelhouse/
+            !docker/inference/wheelhouse/*.whl
+            "#,
+        );
+
+        assert!(ignore.is_ignored(Path::new(".git/config"), false));
+        assert!(ignore.is_ignored(Path::new("benchmarks/run/result.json"), false));
+        assert!(ignore.is_ignored(Path::new("vllm/.venv/bin/python"), false));
+        assert!(ignore.is_ignored(Path::new("docker/inference/nohup.log"), false));
+        assert!(!ignore.is_ignored(Path::new("docker/inference/wheelhouse/torch.whl"), false));
+    }
+
+    #[test]
+    fn context_copy_prunes_dockerignored_directories() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let rootfs = dir.path().join("rootfs");
+        let dest = rootfs.join("opt/app");
+        std::fs::create_dir_all(source.join("benchmarks/deep")).unwrap();
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("benchmarks/deep/result.json"), b"large").unwrap();
+        std::fs::write(source.join("src/main.rs"), b"fn main() {}").unwrap();
+        let ignore = DockerIgnore::parse("benchmarks\n");
+
+        copy_tree_or_file_with_ignore(&source, &dest, &rootfs, Some(&ignore), &source).unwrap();
+
+        assert!(dest.join("src/main.rs").is_file());
+        assert!(!dest.join("benchmarks").exists());
     }
 
     #[test]
