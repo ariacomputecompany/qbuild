@@ -874,11 +874,18 @@ fn execute_run(
         .output()
         .map_err(|e| format!("Failed to execute RUN '{}': {}", command, e))?;
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         return Err(format!(
             "RUN '{}' failed with status {:?}: {}",
             command,
             output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            details
         ));
     }
     Ok(())
@@ -1729,7 +1736,7 @@ fn install_build_resolver(rootfs: &Path) -> Result<(), String> {
     let target_contents = std::fs::read_to_string(&target).ok();
     if target_contents
         .as_deref()
-        .is_some_and(|contents| !uses_loopback_nameserver(contents))
+        .is_some_and(|contents| has_nameserver(contents) && !uses_loopback_nameserver(contents))
     {
         return Ok(());
     }
