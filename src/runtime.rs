@@ -155,6 +155,7 @@ impl RunService {
                 prepare_runtime_rootfs(&rootfs).map_err(std::io::Error::other)?;
                 if mount_namespace {
                     bind_standard_devices(&rootfs).map_err(std::io::Error::other)?;
+                    mount_dev_shm_inside_rootfs(&rootfs).map_err(std::io::Error::other)?;
                 }
                 apply_bind_mounts(&rootfs, &mounts).map_err(std::io::Error::other)?;
                 chroot(&rootfs).map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -340,6 +341,22 @@ fn mount_proc_inside_rootfs() -> Result<(), String> {
         None::<&str>,
     )
     .map_err(|e| format!("Failed to mount /proc in runtime: {}", e))
+}
+
+fn mount_dev_shm_inside_rootfs(rootfs: &Path) -> Result<(), String> {
+    let target = rootfs.join("dev/shm");
+    std::fs::create_dir_all(&target)
+        .map_err(|e| format!("Failed to create runtime /dev/shm: {}", e))?;
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o1777))
+        .map_err(|e| format!("Failed to set runtime /dev/shm permissions: {}", e))?;
+    mount(
+        Some("tmpfs"),
+        target.as_path(),
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=1777,size=67108864"),
+    )
+    .map_err(|e| format!("Failed to mount /dev/shm in runtime: {}", e))
 }
 
 fn bind_standard_devices(rootfs: &Path) -> Result<(), String> {
