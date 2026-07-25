@@ -250,6 +250,7 @@ impl BuildService {
                         &rootfs,
                         &current_workdir,
                         &env_map,
+                        &build_args,
                         &config.user,
                         &current_shell,
                         command,
@@ -802,6 +803,7 @@ fn execute_run(
     rootfs: &Path,
     workdir: &str,
     env_map: &HashMap<String, String>,
+    build_args: &HashMap<String, String>,
     user_spec: &Option<String>,
     shell: &[String],
     command: &str,
@@ -844,6 +846,11 @@ fn execute_run(
     cmd.env_clear();
     for (key, value) in env_map {
         cmd.env(key, value);
+    }
+    for (key, value) in build_args {
+        if !env_map.contains_key(key) {
+            cmd.env(key, value);
+        }
     }
     cmd.env(
         "PATH",
